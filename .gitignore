@@ -1,0 +1,33 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Web
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# Assets fetched by scripts/fetch_assets.sh
+assets/third_party/
+
+# Generated data / secrets
+data/
+certs/
+*.hdf5
+*.tmp
+*.log
+.env
+
+# Personal notes (machine-specific paths / IPs)
+howToRun.md
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

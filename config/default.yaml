@@ -1,0 +1,43 @@
+# QuestCollect default configuration.
+
+sim:
+  physics_dt: 0.002          # 500 Hz physics
+  control_hz: 50             # control + recording rate
+  publish_hz: 60             # pose stream to headset / dashboard
+  table_height: 0.75
+  arm_spacing: 0.6           # distance between the two arm bases (m)
+
+task: transfer_cube
+
+teleop:
+  mode: controllers          # controllers | hands
+  scale: 1.0                 # hand motion -> EE motion
+  pinch_open_m: 0.08         # thumb-index distance mapped to fully open gripper
+  pinch_closed_m: 0.015      # thumb-index distance mapped to closed gripper
+  filter_min_cutoff: 1.5     # One-Euro filter params
+  filter_beta: 0.5
+  workspace_min: [0.05, -0.65, 0.76]
+  workspace_max: [0.95, 0.65, 1.45]
+
+ik:
+  position_cost: 1.0
+  orientation_cost: 0.6
+  posture_cost: 0.01
+  max_joint_vel: 2.5         # rad/s
+  collision_margin: 0.03     # min distance between the two arms (m)
+  iterations: 2
+
+record:
+  out_dir: data/raw
+  countdown_s: 3
+  cameras: [cam_high, cam_low, cam_left_wrist, cam_right_wrist]
+  live_images: false         # store images while recording (exporter re-renders from state otherwise)
+  image_height: 480
+  image_width: 640
+  operator: operator
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  https_port: 8443
+  cert_dir: certs

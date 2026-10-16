@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuestCollect XR</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦾</text></svg>" />
+  </head>
+  <body>
+    <div id="stage"></div>
+    <main class="landing">
+      <section class="card">
+        <header>
+          <div class="brand"><span class="logo">◆</span> QuestCollect</div>
+          <span id="conn" class="pill bad">Server offline</span>
+        </header>
+        <h1>Bimanual teleop <span class="grad">in MuJoCo</span></h1>
+        <p class="lead">Drive two Franka arms with your hands or Touch controllers and record demonstrations for imitation learning.</p>
+
+        <label class="label">Input mode</label>
+        <div class="seg">
+          <button data-mode="controllers"><span>🎮</span> Controllers</button>
+          <button data-mode="hands"><span>✋</span> Hands</button>
+        </div>
+
+        <label class="label" for="task">Task</label>
+        <select id="task"></select>
+        <p id="instruction" class="instruction"></p>
+
+        <div class="enter">
+          <button id="enter-vr" class="primary">Enter VR</button>
+          <button id="enter-ar" class="secondary">Enter Mixed Reality</button>
+        </div>
+        <p id="xr-hint" class="hint"></p>
+
+        <div class="cheats">
+          <div><b>Controllers</b> · hold <kbd>Grip</kbd> to move · <kbd>Trigger</kbd> gripper · <kbd>A</kbd> record · <kbd>X</kbd> save · <kbd>B</kbd> discard · <kbd>Y</kbd> menu · <kbd>L-stick</kbd> recenter</div>
+          <div><b>Hands</b> · thumb–<b>middle</b> pinch toggles engage · thumb–<b>index</b> pinch = gripper · look at your left palm for the menu</div>
+        </div>
+        <footer><span id="saved">0</span> episodes saved this session</footer>
+      </section>
+    </main>
+    <div id="toasts"></div>
+    <script type="module" src="/src/xr/main.ts"></script>
+  </body>
+</html>
