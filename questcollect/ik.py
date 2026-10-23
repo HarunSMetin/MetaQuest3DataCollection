@@ -1,4 +1,4 @@
-"""Differential IK for both arms with mink (one QP, limits + arm-arm collision avoidance)."""
+"""Differential IK for both arms with mink (one QP, joint limits + optional arm-arm collision avoidance)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import mujoco
 import numpy as np
 
 from questcollect.config import IKConfig, SimConfig
-from questcollect.sim.scene import ARM_JOINTS, ARMS, HOME_Q, build_spec
+from questcollect.sim import ARM_JOINTS, ARMS, HOME_Q, build_spec
 
 COLLISION_BODIES = ("link4", "link5", "link6", "link7", "hand", "left_finger", "right_finger")
 
@@ -26,7 +26,7 @@ class BimanualIK:
     def __init__(self, sim_cfg: SimConfig, cfg: IKConfig, dt: float):
         self.cfg = cfg
         self.dt = dt
-        self.model = build_spec(sim_cfg).compile()
+        self.model = build_spec(sim_cfg, with_task=False).compile()
         self.configuration = mink.Configuration(self.model)
         m = self.model
         self.arm_qadr = np.array([m.joint(f"{a}_{j}").qposadr[0] for a in ARMS for j in ARM_JOINTS])
@@ -39,15 +39,13 @@ class BimanualIK:
         self.posture = mink.PostureTask(m, cost=cfg.posture_cost)
         self.tasks = [*self.frame_tasks.values(), self.posture]
         vel = {f"{a}_{j}": cfg.max_joint_vel for a in ARMS for j in ARM_JOINTS}
-        self.limits = [
-            mink.ConfigurationLimit(m),
-            mink.VelocityLimit(m, vel),
-            mink.CollisionAvoidanceLimit(
+        self.limits = [mink.ConfigurationLimit(m), mink.VelocityLimit(m, vel)]
+        if cfg.avoid_arm_collisions:  # otherwise the arms collide in the physics, like real ones
+            self.limits.append(mink.CollisionAvoidanceLimit(
                 m, geom_pairs=[(_collision_geoms(m, "l"), _collision_geoms(m, "r"))],
                 minimum_distance_from_collisions=cfg.collision_margin,
                 collision_detection_distance=cfg.collision_margin + 0.08,
-            ),
-        ]
+            ))
         self.reset(np.tile(HOME_Q, 2))
 
     def reset(self, arm_q: np.ndarray) -> None:
@@ -57,6 +55,19 @@ class BimanualIK:
         self.posture.set_target(q)
         for a in ARMS:
             self.frame_tasks[a].set_target(self.configuration.get_transform_frame_to_world(f"{a}_tcp", "site"))
+
+    def follow(self, arm_q: np.ndarray) -> None:
+        """Keep the IK within max_lead rad of the measured joint angles (call before solve).
+
+        The IK has no obstacles but the arm-arm limit; physics does. When an arm is blocked (table, the
+        other arm, a brick), the IK would otherwise run on through the obstacle while the arm stays put,
+        then yank the arm across when it comes free. In free motion the arm trails its target by about
+        speed x kd/kp (~0.1 s), so a lead of 0.15 rad leaves moves up to ~1.5 rad/s untouched.
+        """
+        q = self.configuration.q.copy()
+        lead = q[self.arm_qadr] - arm_q
+        q[self.arm_qadr] = arm_q + np.clip(lead, -self.cfg.max_lead, self.cfg.max_lead)
+        self.configuration.update(q)
 
     def tcp_pose(self, arm: str) -> tuple[np.ndarray, np.ndarray]:
         T = self.configuration.get_transform_frame_to_world(f"{arm}_tcp", "site")

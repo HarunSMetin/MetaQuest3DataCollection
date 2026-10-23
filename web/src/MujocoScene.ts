@@ -3,7 +3,7 @@
 
 import * as THREE from "three";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import { FLAG_ENGAGED_L, FLAG_ENGAGED_R, type PoseFrame } from "../protocol";
+import { FLAG_ENGAGED_L, FLAG_ENGAGED_R, type PoseFrame } from "./protocol";
 
 export const ARM_COLORS = { l: new THREE.Color("#22d3ee"), r: new THREE.Color("#f472b6") };
 
@@ -27,10 +27,14 @@ export interface SceneDesc {
   meshes: MeshDesc[];
 }
 
-interface BufferedFrame { t: number; bodies: Float32Array; ghosts: Float32Array; grippers: Float32Array; flags: number }
+interface BufferedFrame { t: number; bodies: Float32Array; flags: number }
+
+/** Grasp-point marker (the server's `<arm>_tcp_marker` geom) plus a drop line to the table under it. */
+interface TcpMarker { arm: "l" | "r"; body: THREE.Object3D; sphere: THREE.Mesh; line: THREE.Line; dot: THREE.Mesh }
 
 const INTERP_DELAY_MS = 30;
 const CREASE_ANGLE = THREE.MathUtils.degToRad(35);
+const OUT_OF_REACH = new THREE.Color("#ef4444");
 
 function gridTexture(): THREE.CanvasTexture {
   const c = document.createElement("canvas");
@@ -54,37 +58,25 @@ function gridTexture(): THREE.CanvasTexture {
   return t;
 }
 
-function makeGhost(color: THREE.Color): THREE.Group {
-  const g = new THREE.Group();
-  const mat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.6, transparent: true, opacity: 0.35, depthWrite: false });
-  const palm = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.17, 0.02), mat);
-  palm.position.z = -0.06;
-  const f1 = new THREE.Mesh(new THREE.BoxGeometry(0.016, 0.01, 0.05), mat);
-  const f2 = f1.clone();
-  f1.name = "f1"; f2.name = "f2";
-  const tip = new THREE.Mesh(new THREE.SphereGeometry(0.008, 12, 8), mat);
-  g.add(palm, f1, f2, tip);
-  g.userData.mat = mat;
-  return g;
-}
-
 export class MujocoScene {
   readonly root = new THREE.Group();          // world -> xr placement applied here
   readonly environment = new THREE.Group();   // floor + backdrop (hidden in passthrough)
-  readonly ghosts: [THREE.Group, THREE.Group];
   desc: SceneDesc | null = null;
   engaged = { l: false, r: false };
+  private outOfReach = { l: false, r: false };
   private bodies: THREE.Object3D[] = [];
+  private markers: TcpMarker[] = [];
+  private tableZ = 0;
   private frames: BufferedFrame[] = [];
   private clockOffset = Number.POSITIVE_INFINITY;
   private materials = new Map<string, THREE.Material>();
   private geometries: THREE.BufferGeometry[] = [];
   private tmpQa = new THREE.Quaternion();
   private tmpQb = new THREE.Quaternion();
+  private tmpV = new THREE.Vector3();
 
   constructor(private opts: { shadows: boolean }) {
     this.root.matrixAutoUpdate = false;
-    this.ghosts = [makeGhost(ARM_COLORS.l), makeGhost(ARM_COLORS.r)];
     this.addLights();
   }
 
@@ -184,16 +176,42 @@ export class MujocoScene {
       const isFloor = g.name === "floor";
       mesh.castShadow = this.opts.shadows && !isFloor && g.type !== "plane";
       mesh.receiveShadow = this.opts.shadows;
+      if (g.name === "table_top") this.tableZ = g.pos[2] + s[2];
       if (isFloor) this.environment.add(mesh);
       else this.bodies[g.body].add(mesh);
+      if (g.name.endsWith("_tcp_marker")) this.addMarker(g.name.startsWith("l_") ? "l" : "r", mesh);
     }
     this.bodies[0].add(this.environment);
-    for (const gh of this.ghosts) this.root.add(gh);
     this.frames = [];
+  }
+
+  private addMarker(arm: "l" | "r", sphere: THREE.Mesh) {
+    const color = ARM_COLORS[arm];
+    // Drawn on top of the fingers so the grasp point stays visible between them.
+    sphere.material = new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true });
+    sphere.renderOrder = 10;
+    sphere.castShadow = sphere.receiveShadow = false;
+    const lineGeo = new THREE.BufferGeometry().setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 }));
+    line.frustumCulled = false;
+    const dot = new THREE.Mesh(new THREE.RingGeometry(0.004, 0.007, 24), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.8 }));
+    this.geometries.push(lineGeo, dot.geometry);
+    this.root.add(line, dot);
+    this.markers.push({ arm, body: sphere.parent!, sphere, line, dot });
+  }
+
+  /** Markers turn red while the IK can't get that gripper to its target. */
+  setOutOfReach(outOfReach: { l: boolean; r: boolean }) {
+    this.outOfReach = { ...outOfReach };
   }
 
   private clear() {
     for (const b of this.bodies) this.root.remove(b);
+    for (const mk of this.markers) {
+      this.root.remove(mk.line, mk.dot);
+      for (const o of [mk.sphere, mk.line, mk.dot]) (o.material as THREE.Material).dispose();
+    }
+    this.markers = [];
     for (const g of this.geometries) g.dispose();
     for (const m of this.materials.values()) m.dispose();
     this.bodies = [];
@@ -211,7 +229,7 @@ export class MujocoScene {
   pushFrame(f: PoseFrame, recvMs: number) {
     if (!this.desc || f.nbody !== this.desc.nbody) return;
     this.clockOffset = Math.min(this.clockOffset + 0.05, recvMs - f.tServer);
-    this.frames.push({ t: f.tServer + this.clockOffset, bodies: f.bodies.slice(), ghosts: f.ghosts.slice(), grippers: f.grippers.slice(), flags: f.flags });
+    this.frames.push({ t: f.tServer + this.clockOffset, bodies: f.bodies.slice(), flags: f.flags });
     if (this.frames.length > 8) this.frames.shift();
   }
 
@@ -240,17 +258,21 @@ export class MujocoScene {
 
     const latest = this.frames[n - 1];
     this.engaged = { l: !!(latest.flags & FLAG_ENGAGED_L), r: !!(latest.flags & FLAG_ENGAGED_R) };
-    this.ghosts.forEach((gh, i) => {
-      const k = i * 7, G = latest.ghosts;
-      gh.position.set(G[k], G[k + 1], G[k + 2]);
-      gh.quaternion.set(G[k + 3], G[k + 4], G[k + 5], G[k + 6]);
-      const w = 0.01 + 0.08 * latest.grippers[i];
-      gh.getObjectByName("f1")!.position.set(0, w / 2 + 0.005, -0.025);
-      gh.getObjectByName("f2")!.position.set(0, -w / 2 - 0.005, -0.025);
-      const engaged = i === 0 ? this.engaged.l : this.engaged.r;
-      const mat = gh.userData.mat as THREE.MeshStandardMaterial;
-      mat.opacity = engaged ? 0.55 : 0.18;
-      mat.emissiveIntensity = engaged ? 1.2 : 0.4;
-    });
+    for (const mk of this.markers) {
+      const color = this.outOfReach[mk.arm] ? OUT_OF_REACH : ARM_COLORS[mk.arm];
+      const engaged = this.engaged[mk.arm];
+      for (const o of [mk.sphere, mk.line, mk.dot]) (o.material as THREE.MeshBasicMaterial).color.copy(color);
+      (mk.sphere.material as THREE.MeshBasicMaterial).opacity = engaged ? 1 : 0.6;
+      // Grasp point in world coordinates (bodies are direct children of root).
+      const p = this.tmpV.copy(mk.sphere.position).applyQuaternion(mk.body.quaternion).add(mk.body.position);
+      const z = this.tableZ + 0.0005, above = p.z > z + 0.003;
+      mk.line.visible = mk.dot.visible = above;
+      if (!above) continue;
+      const pos = mk.line.geometry.getAttribute("position") as THREE.BufferAttribute;
+      pos.setXYZ(0, p.x, p.y, p.z);
+      pos.setXYZ(1, p.x, p.y, z);
+      pos.needsUpdate = true;
+      mk.dot.position.set(p.x, p.y, z);
+    }
   }
 }

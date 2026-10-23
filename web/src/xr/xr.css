@@ -29,12 +29,11 @@ h1 { font-size: clamp(26px, 5vw, 36px); line-height: 1.1; margin: 4px 0 8px; let
 .lead { color: var(--dim); margin: 0 0 22px; line-height: 1.5; }
 .label { display: block; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); margin: 16px 0 8px; }
 .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.seg button, select { appearance: none; border: 1px solid var(--stroke); background: rgba(255,255,255,0.04); color: var(--text);
+.seg button { appearance: none; border: 1px solid var(--stroke); background: rgba(255,255,255,0.04); color: var(--text);
   padding: 14px 16px; border-radius: 14px; font: inherit; font-weight: 650; cursor: pointer; transition: all .15s; }
-.seg button:hover, select:hover { border-color: var(--accent); }
+.seg button:hover { border-color: var(--accent); }
 .seg button.active { background: linear-gradient(180deg, rgba(124,156,255,0.35), rgba(124,156,255,0.15)); border-color: var(--accent); box-shadow: 0 0 24px rgba(124,156,255,0.25); }
 .seg button span { margin-right: 6px; }
-select { width: 100%; text-transform: capitalize; }
 .instruction { color: var(--dim); font-size: 14px; line-height: 1.5; min-height: 2.6em; margin: 10px 2px 0; }
 .enter { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 22px; }
 .enter button { border: 0; border-radius: 16px; padding: 18px; font: inherit; font-weight: 800; font-size: 17px; cursor: pointer; transition: transform .1s, box-shadow .2s; }

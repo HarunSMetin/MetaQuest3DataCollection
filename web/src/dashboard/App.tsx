@@ -1,21 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "../net";
-import { type EpisodeRow, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status } from "../protocol";
+import { drawGoal, levelStates } from "../goal";
+import { type EpisodeRow, fetchTask, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
 import { Viewer3D, type ViewerHandle } from "./Viewer3D";
 
 type Toast = { id: number; text: string; kind: string };
 
 const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${(s % 60).toFixed(1).padStart(4, "0")}`;
-const pretty = (t: string) => t.replace(/_/g, " ");
 
 export function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [online, setOnline] = useState(false);
   const [episodes, setEpisodes] = useState<EpisodeRow[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [task, setTask] = useState<TaskSpec | null>(null);
   const viewer = useRef<ViewerHandle | null>(null);
   const link = useRef<Link | null>(null);
-  const sceneVersion = useRef(-1);
 
   const refreshEpisodes = useCallback(() => {
     fetch("/api/episodes").then((r) => r.json()).then(setEpisodes).catch(() => {});
@@ -29,14 +29,11 @@ export function App() {
 
   useEffect(() => {
     const l = new Link("/ws/dash", {
-      onOpen: () => setOnline(true),
+      // (Re)load the 3D scene on every connect, so a restarted server with a changed scene is picked up.
+      onOpen: () => { setOnline(true); viewer.current?.reload(); fetchTask().then(setTask).catch(() => {}); },
       onClose: () => setOnline(false),
       onPose: (f) => viewer.current?.push(f),
-      onStatus: (s) => {
-        if (sceneVersion.current !== -1 && s.scene_version !== sceneVersion.current) viewer.current?.reload();
-        sceneVersion.current = s.scene_version;
-        setStatus(s);
-      },
+      onStatus: (s) => { setStatus(s); viewer.current?.status(s); },
       onEvent: (e: ServerEvent) => {
         if (e.type === "toast") toast(e.text, e.kind);
         if (e.type === "saved") setTimeout(refreshEpisodes, 600);
@@ -72,7 +69,7 @@ export function App() {
           <div className="card viewer-card">
             <div className="card-head">
               <h2>Live scene</h2>
-              <div className="legend"><i className="dot l" /> left arm <i className="dot r" /> right arm <span className="muted">· ghosts = teleop targets</span></div>
+              <div className="legend"><i className="dot l" /> left arm <i className="dot r" /> right arm <span className="muted">· dot = grasp point (red: out of reach)</span></div>
             </div>
             <Viewer3D handle={viewer} />
             <StateOverlay status={status} />
@@ -80,12 +77,51 @@ export function App() {
           <Cameras names={["cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist"]} />
         </section>
         <aside className="col-side">
+          <GoalCard task={task} status={status} />
           <RecorderCard status={status} cmd={cmd} />
           <TeleopCard status={status} cmd={cmd} />
           <EpisodesCard episodes={episodes} status={status} cmd={cmd} refresh={refreshEpisodes} />
         </aside>
       </main>
       <div className="toasts">{toasts.map((t) => <div key={t.id} className={`toast ${t.kind}`}>{t.text}</div>)}</div>
+    </div>
+  );
+}
+
+function GoalCard({ task, status }: { task: TaskSpec | null; status: Status | null }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const states = task ? levelStates(task, status?.progress ?? 0, status?.in_area ?? false) : [];
+  const key = states.join();
+  useEffect(() => {
+    const c = canvas.current;
+    if (!c || !task) return;
+    const dpr = devicePixelRatio || 1;
+    c.width = c.clientWidth * dpr;
+    c.height = c.clientHeight * dpr;
+    const g = c.getContext("2d")!;
+    g.clearRect(0, 0, c.width, c.height);
+    drawGoal(g, task, states, { x: 0, y: 0, w: c.width, h: c.height }, 1);
+  }, [task, key]); // eslint-disable-line react-hooks/exhaustive-deps
+  const done = states.filter((s) => s === "placed").length;
+  return (
+    <div className="card goal">
+      <div className="card-head"><h2>Goal</h2><span className="muted">{task ? `${done} / ${task.goal.length} placed` : ""}</span></div>
+      <div className="goal-body">
+        <canvas ref={canvas} />
+        <ol>
+          {task?.goal.map((e, k) => {
+            const b = task.bricks[e.brick];
+            const [r, g, bl] = b.rgba.map((v) => Math.round(v * 255));
+            return (
+              <li key={k} className={states[k]}>
+                <i style={{ background: `rgb(${r},${g},${bl})` }} />
+                <span>{b.label}{k === 0 && <em> in the taped area</em>}</span>
+                <b>{states[k] === "placed" ? "✓" : states[k] === "next" ? "next" : ""}</b>
+              </li>
+            );
+          })}
+        </ol>
+      </div>
     </div>
   );
 }
@@ -152,17 +188,10 @@ function RecorderCard({ status, cmd }: { status: Status | null; cmd: (n: string,
   return (
     <div className="card">
       <div className="card-head"><h2>Recorder</h2><span className="muted">{s?.saved_count ?? 0} saved this session</span></div>
-      <div className="row2">
-        <label>Task
-          <select value={s?.task ?? ""} disabled={rec !== "idle"} onChange={(e) => cmd("set_task", { task: e.target.value })}>
-            {s?.tasks.map((t) => <option key={t} value={t}>{pretty(t)}</option>)}
-          </select>
-        </label>
-        <label>Operator
-          <input value={operator} onChange={(e) => setOperator(e.target.value)} onBlur={() => cmd("set_operator", { operator })} />
-        </label>
-      </div>
-      <p className="instruction">{s?.instruction}</p>
+      <label>Operator
+        <input value={operator} onChange={(e) => setOperator(e.target.value)} onBlur={() => cmd("set_operator", { operator })} />
+      </label>
+      <p className="instruction">{s?.instruction}{s && <><br /><b>Tower: {s.progress} / {s.levels} placed</b></>}</p>
       <button className={`rec-btn ${rec}`} disabled={rec === "review" || !!s?.replay} onClick={() => cmd("record_toggle")}>
         <i />
         <span>{rec === "recording" ? `Stop · ${fmt(s!.elapsed)}` : rec === "countdown" ? `Starting in ${Math.ceil(s!.countdown)}…` : rec === "review" ? "Review take" : "Start recording"}</span>
@@ -234,8 +263,7 @@ function Warn({ on, text }: { on: boolean; text: string }) {
 function EpisodesCard({ episodes, status, cmd, refresh }: {
   episodes: EpisodeRow[]; status: Status | null; cmd: (n: string, a?: Record<string, unknown>) => void; refresh: () => void;
 }) {
-  const [filter, setFilter] = useState<string>("all");
-  const rows = episodes.filter((e) => filter === "all" || e.task === filter).slice().reverse();
+  const rows = episodes.slice().reverse();
   const ok = rows.filter((e) => e.success).length;
   const total = rows.reduce((a, e) => a + (e.duration_s || 0), 0);
   const del = async (p: string) => {
@@ -245,12 +273,7 @@ function EpisodesCard({ episodes, status, cmd, refresh }: {
   };
   return (
     <div className="card episodes">
-      <div className="card-head"><h2>Dataset</h2>
-        <select className="small" value={filter} onChange={(e) => setFilter(e.target.value)}>
-          <option value="all">all tasks</option>
-          {status?.tasks.map((t) => <option key={t} value={t}>{pretty(t)}</option>)}
-        </select>
-      </div>
+      <div className="card-head"><h2>Dataset</h2><span className="muted">{status?.task.replace(/_/g, " ")}</span></div>
       <div className="stats">
         <div><b>{rows.length}</b><span>episodes</span></div>
         <div><b>{rows.length ? Math.round((100 * ok) / rows.length) : 0}%</b><span>success</span></div>
@@ -263,7 +286,7 @@ function EpisodesCard({ episodes, status, cmd, refresh }: {
             <span className={`badge ${e.success ? "ok" : "warn"}`}>{e.success ? "✓" : "✗"}</span>
             <div className="ep-main">
               <b>{e.file.replace("episode_", "#").replace(".hdf5", "")}</b>
-              <span className="muted">{pretty(e.task)} · {e.input_mode === "hands" ? "✋" : "🎮"} · {e.duration_s?.toFixed(1)} s</span>
+              <span className="muted">{e.input_mode === "hands" ? "✋" : "🎮"} · {e.duration_s?.toFixed(1)} s</span>
             </div>
             <button className="icon" title="Replay in sim" disabled={status?.rec_state !== "idle"} onClick={() => cmd("replay", { path: e.path })}>▶</button>
             <button className="icon danger" title="Delete" onClick={() => del(e.path)}>🗑</button>

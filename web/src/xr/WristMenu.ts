@@ -1,14 +1,16 @@
 // Wrist-attached control menu (left hand / left controller).
 
-import type { Status } from "../../protocol";
+import type { Status } from "../protocol";
 import { button, glass, Panel, text, THEME } from "./Panel";
 
-const W = 0.24, H = 0.4;
-const PX = 2400; // high density: viewed up close (canvas 576 x 960)
+const W = 0.24, H = 0.375;
+const PX = 2400; // high density: viewed up close (canvas 576 x 900)
 
 export interface MenuActions {
   command: (name: string, args?: Record<string, unknown>) => void;
   exit: () => void;
+  toggleSound: () => void;
+  soundOn: () => boolean;
 }
 
 export class WristMenu {
@@ -23,10 +25,9 @@ export class WristMenu {
       text(g, "QUESTCOLLECT", 40, 52, 30, { weight: 800, color: THEME.accent });
       text(g, s ? `${s.saved_count} saved` : "", w - 40, 52, 26, { align: "right", color: THEME.dim, weight: 600 });
       text(g, "INPUT MODE", 40, 112, 22, { color: THEME.dim, weight: 700 });
-      text(g, "TASK", 40, 272, 22, { color: THEME.dim, weight: 700 });
-      text(g, "EPISODE", 40, 432, 22, { color: THEME.dim, weight: 700 });
-      text(g, "VIEW", 40, 718, 22, { color: THEME.dim, weight: 700 });
-      if (s) text(g, `scale ×${s.scale.toFixed(2)}`, w - 40, 718, 22, { align: "right", color: THEME.dim, weight: 700 });
+      text(g, "EPISODE", 40, 272, 22, { color: THEME.dim, weight: 700 });
+      text(g, "VIEW", 40, 558, 22, { color: THEME.dim, weight: 700 });
+      if (s) text(g, `scale ×${s.scale.toFixed(2)}`, w - 40, 558, 22, { align: "right", color: THEME.dim, weight: 700 });
     });
     this.build();
     this.panel.mesh.visible = false;
@@ -51,16 +52,8 @@ export class WristMenu {
       button("mode-hands", m + col2 + gap, 134, col2, 110, () => "Hands", () => cmd("set_mode", { mode: "hands" }),
         { icon: () => "✋", active: () => s()?.mode === "hands" }),
 
-      // task picker
-      button("task-prev", m, 294, 100, 110, () => "‹", () => this.cycleTask(-1), { enabled: idle }),
-      {
-        id: "task-label", x: m + 112, y: 294, w: CW - 2 * m - 224, h: 110,
-        draw: (g) => text(g, (s()?.task ?? "—").replace(/_/g, " "), CW / 2, 349, 32, { align: "center", weight: 800 }),
-      },
-      button("task-next", CW - m - 100, 294, 100, 110, () => "›", () => this.cycleTask(1), { enabled: idle }),
-
       // recording
-      button("rec", m, 454, CW - 2 * m, 120,
+      button("rec", m, 294, CW - 2 * m, 120,
         () => (rec() === "recording" ? "Stop" : rec() === "countdown" ? "Cancel" : "Record"),
         () => cmd("record_toggle"),
         {
@@ -68,30 +61,25 @@ export class WristMenu {
           active: () => rec() === "recording" || rec() === "countdown",
           enabled: () => rec() !== "review" && !s()?.replay,
         }),
-      button("save-ok", c3(0), 590, col3, 96, () => "Success", () => cmd("save", { success: true }),
+      button("save-ok", c3(0), 430, col3, 96, () => "Success", () => cmd("save", { success: true }),
         { icon: () => "✓", color: () => THEME.ok, enabled: canSave }),
-      button("save-fail", c3(1), 590, col3, 96, () => "Failure", () => cmd("save", { success: false }),
+      button("save-fail", c3(1), 430, col3, 96, () => "Failure", () => cmd("save", { success: false }),
         { icon: () => "✗", color: () => THEME.warn, enabled: canSave }),
-      button("discard", c3(2), 590, col3, 96, () => "Discard", () => cmd("discard"),
+      button("discard", c3(2), 430, col3, 96, () => "Discard", () => cmd("discard"),
         { icon: () => "🗑", color: () => THEME.rec, enabled: () => rec() !== "idle" }),
 
       // view
-      button("recenter", c3(0), 740, col3, 96, () => "Recenter", () => cmd("recenter"), { icon: () => "⟲" }),
-      button("scale-down", c3(1), 740, col3, 96, () => "Slower", () => cmd("set_scale", { scale: (s()?.scale ?? 1) - 0.25 }),
+      button("recenter", c3(0), 580, col3, 96, () => "Recenter", () => cmd("recenter"), { icon: () => "⟲" }),
+      button("scale-down", c3(1), 580, col3, 96, () => "Slower", () => cmd("set_scale", { scale: (s()?.scale ?? 1) - 0.25 }),
         { icon: () => "−" }),
-      button("scale-up", c3(2), 740, col3, 96, () => "Faster", () => cmd("set_scale", { scale: (s()?.scale ?? 1) + 0.25 }),
+      button("scale-up", c3(2), 580, col3, 96, () => "Faster", () => cmd("set_scale", { scale: (s()?.scale ?? 1) + 0.25 }),
         { icon: () => "+" }),
 
-      button("reset", m, 850, col2, 80, () => "↺  New scene", () => cmd("reset"), { enabled: idle }),
-      button("exit", m + col2 + gap, 850, col2, 80, () => "⏏  Exit XR", () => this.act.exit()),
+      button("reset", m, 690, col2, 80, () => "↺  New scene", () => cmd("reset"), { enabled: idle }),
+      button("exit", m + col2 + gap, 690, col2, 80, () => "⏏  Exit XR", () => this.act.exit()),
+      button("sound", m, 786, CW - 2 * m, 80, () => (this.act.soundOn() ? "🔊  Sound on" : "🔇  Sound off"),
+        () => { this.act.toggleSound(); this.panel.invalidate(); }, { active: () => this.act.soundOn() }),
     ];
-  }
-
-  private cycleTask(dir: number) {
-    const s = this.status;
-    if (!s || s.rec_state !== "idle") return;
-    const i = s.tasks.indexOf(s.task);
-    this.act.command("set_task", { task: s.tasks[(i + dir + s.tasks.length) % s.tasks.length] });
   }
 
   update(status: Status | null) {

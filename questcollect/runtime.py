@@ -15,19 +15,13 @@ from typing import Callable
 import numpy as np
 
 from questcollect.config import Config
-from questcollect.ik.solver import BimanualIK
-from questcollect.record.hdf5_io import list_episodes, read_episode
-from questcollect.record.recorder import Recorder, RecState
-from questcollect.record.render import CameraRenderer
-from questcollect.server.protocol import (
-    FLAG_ENGAGED_L, FLAG_ENGAGED_R, FLAG_RECORDING, InputFrame, pack_pose_frame,
-)
-from questcollect.sim.env import BimanualEnv
-from questcollect.sim.scene import ARMS
-from questcollect.sim.scene_export import body_poses, export_scene
-from questcollect.sim.tasks import TASKS
-from questcollect.teleop.frames import mat_to_quat_wxyz, quat_wxyz_to_mat, wxyz_to_xyzw
-from questcollect.teleop.teleop import Teleop
+from questcollect.frames import mat_to_quat_wxyz, quat_wxyz_to_mat
+from questcollect.ik import BimanualIK
+from questcollect.protocol import FLAG_ENGAGED_L, FLAG_ENGAGED_R, FLAG_RECORDING, InputFrame, pack_pose_frame
+from questcollect.recorder import Recorder, RecState, list_episodes, read_episode
+from questcollect.scene_export import body_poses, export_scene
+from questcollect.sim import ARMS, BRICKS, INSTRUCTION, LEVELS, TASK, BimanualEnv, CameraRenderer, task_spec
+from questcollect.teleop import Teleop
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +29,18 @@ STATUS_EVERY = 5          # ticks (10 Hz at 50 Hz control)
 PREVIEW_EVERY = 6         # ticks (~8 Hz)
 PREVIEW_SIZE = (240, 320)
 IK_WARN_M = 0.03
+# Task haptics: (intensity, ms, repeat, gap_ms). Distinct patterns so the operator can tell them apart.
+# Most come with a sound cue of the same name (web/src/xr/sounds.ts), panned to that arm's side.
+HAPTIC_GRASP = (0.5, 40, 1, 0)        # fingers closed on a brick
+HAPTIC_HOLD_TICK = (0.15, 20, 1, 0)   # every HOLD_TICK_S while holding
+HAPTIC_RELEASE = (0.2, 20, 1, 0)
+HAPTIC_CLICK = (0.8, 15, 1, 0)        # a brick clicked onto studs (anywhere but its tower spot)
+HAPTIC_UNCLICK = (0.4, 30, 1, 0)      # a clicked brick was pulled off
+HAPTIC_PLACED = (0.9, 60, 2, 70)      # a brick clicked into its correct spot on the tower
+HAPTIC_COMPLETE = (1.0, 120, 3, 80)   # tower finished and standing
+HOLD_TICK_S = 0.25
+HAPTIC_QUIET_S = 0.4                  # no hold ticks right after a pattern (a new pulse cuts off the old one)
+WARN_SOUND_GAP_S = 1.0                # at most one sound per warning kind and arm per second
 
 
 def _ms() -> float:
@@ -45,10 +51,17 @@ class Runtime:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.dt = 1.0 / cfg.sim.control_hz
+        self.env = BimanualEnv(cfg)
         self.teleop = Teleop(cfg.teleop)
         self.placement = self.teleop.placement
         self.ik = BimanualIK(cfg.sim, cfg.ik, self.dt)
         self.recorder = Recorder(cfg, cfg.out_dir)
+        self._scene_json, self._scene_blob = export_scene(self.env.model)
+
+        m = self.env.model
+        self._arm_bodies = {a: {b for b in range(m.nbody) if m.body(b).name.startswith(f"{a}_")} for a in ARMS}
+        self._finger_bodies = {b for b in range(m.nbody) if "finger" in m.body(b).name}
+        self._table_body = m.body("table").id
 
         self._input: InputFrame | None = None
         self._input_lock = threading.Lock()
@@ -62,17 +75,25 @@ class Runtime:
         self._status: dict = {}
         self._previews: dict[str, bytes] = {}
         self._previews_wanted_until = 0.0
+        self._preview_renderer: CameraRenderer | None = None
         self._listeners: list[Callable[[dict], None]] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick_count = 0
         self._loop_hz = float(cfg.sim.control_hz)
         self._replay: dict | None = None
-        self._preview_renderer: CameraRenderer | None = None
-        self._record_renderer: CameraRenderer | None = None
         self._warn = {"arm_collision": False, "table_collision": False, "ik_saturated": False}
-        self.scene_version = 0
-        self._load_task(cfg.task)
+        self._reach = {a: False for a in ARMS}
+        self._engaged = {a: False for a in ARMS}
+        self._warn_sound_at: dict[tuple[str, str | None], float] = {}
+        self._base_in_area = False
+        self._held: dict[str, int | None] = {a: None for a in ARMS}
+        self._last_holder: list[str | None] = [None] * len(BRICKS)
+        self._progress = 0
+        self._complete = False
+        self._hold_tick_at = {a: 0.0 for a in ARMS}
+        self._quiet_until = {a: 0.0 for a in ARMS}
+        self._reset_scene()
 
     # -- public, thread-safe ---------------------------------------------------------------------
     def start(self) -> None:
@@ -119,6 +140,9 @@ class Runtime:
     def scene(self) -> tuple[dict, bytes]:
         return self._scene_json, self._scene_blob
 
+    def task(self) -> dict:
+        return task_spec()
+
     def episodes(self) -> list[dict]:
         return list_episodes(self.cfg.out_dir)
 
@@ -130,25 +154,32 @@ class Runtime:
             except Exception:  # noqa: BLE001 - a broken listener must not kill the sim loop
                 log.exception("listener failed")
 
-    def _load_task(self, name: str) -> None:
-        self.env = BimanualEnv(self.cfg, name)
-        self._scene_json, self._scene_blob = export_scene(self.env.model)
-        self.scene_version += 1
-        self._scene_json["version"] = self.scene_version
-        m = self.env.model
-        self._arm_bodies = {
-            a: {b for b in range(m.nbody) if m.body(b).name.startswith(f"{a}_")} for a in ARMS
-        }
-        self._finger_bodies = {b for b in range(m.nbody) if "finger" in m.body(b).name}
-        self._table_body = m.body("table").id
-        for r in (self._preview_renderer, self._record_renderer):
-            if r is not None:
-                r.close()
-        self._preview_renderer = self._record_renderer = None
-        self._reset_scene()
+    def _toast(self, text: str, kind: str = "info") -> None:
+        self._emit({"type": "toast", "text": text, "kind": kind})
+
+    def _haptic(self, arm: str, intensity: float, ms: int, repeat: int = 1, gap_ms: int = 0) -> None:
+        self._emit({"type": "haptic", "arm": arm, "intensity": intensity, "ms": ms, "repeat": repeat, "gap_ms": gap_ms})
+
+    def _haptic_both(self, intensity: float, ms: int, repeat: int = 1, gap_ms: int = 0) -> None:
+        for a in ARMS:
+            self._haptic(a, intensity, ms, repeat, gap_ms)
+
+    def _sound(self, name: str, arm: str | None = None) -> None:
+        """Sound cue for the headset (arm: which side to pan it to; None = centre)."""
+        self._emit({"type": "sound", "name": name, "arm": arm})
+
+    def _warn_sound(self, name: str, arm: str | None, now: float) -> None:
+        if now >= self._warn_sound_at.get((name, arm), 0.0):
+            self._sound(name, arm)
+            self._warn_sound_at[(name, arm)] = now + WARN_SOUND_GAP_S
 
     def _reset_scene(self, seed: int | None = None) -> None:
         obs = self.env.reset(seed)
+        self._held = {a: None for a in ARMS}
+        self._last_holder = [None] * len(BRICKS)
+        self._progress = 0
+        self._complete = False
+        self._base_in_area = False
         self.ik.reset(obs["joint_pos"])
         self.teleop.reset({a: self._ik_pose(a) for a in ARMS})
 
@@ -156,16 +187,12 @@ class Runtime:
         p, q = self.ik.tcp_pose(arm)
         return p, quat_wxyz_to_mat(q)
 
-    def _ensure_preview_renderer(self) -> None:
-        # GL context + mesh upload takes ~0.5 s, so do it up front rather than mid-teleop.
-        if self._preview_renderer is None:
-            try:
-                self._preview_renderer = CameraRenderer(self.env.model, *PREVIEW_SIZE, list(self.cfg.record.cameras))
-            except Exception:  # noqa: BLE001 - previews are optional (no GL available)
-                log.exception("camera previews disabled: offscreen rendering failed")
-
     def _run(self) -> None:
-        self._ensure_preview_renderer()
+        # GL context + mesh upload takes ~0.5 s, so do it up front rather than mid-teleop.
+        try:
+            self._preview_renderer = CameraRenderer(self.env.model, *PREVIEW_SIZE, list(self.cfg.record.cameras))
+        except Exception:  # noqa: BLE001 - previews are optional (no GL available)
+            log.exception("camera previews disabled: offscreen rendering failed")
         next_t = time.perf_counter()
         window_start, window_ticks = next_t, 0
         while not self._stop.is_set():
@@ -200,31 +227,22 @@ class Runtime:
             was = rec.state
             rec.toggle(now)
             if was == RecState.IDLE and rec.state == RecState.COUNTDOWN:
-                self._emit({"type": "toast", "text": "Get ready…", "kind": "info"})
+                self._toast("Get ready…")
         elif name == "save":
             path = rec.save(self.env, self.teleop.mode, kw.get("success"))
             if path:
                 self._emit({"type": "saved", "path": path})
-                self._emit({"type": "toast", "text": f"Saved {path.rsplit('/', 1)[-1]}", "kind": "success"})
+                self._toast(f"Saved {path.rsplit('/', 1)[-1]}", "success")
                 self._haptic_both(0.8, 80)
                 self._reset_scene()
         elif name == "discard":
             if rec.discard():
-                self._emit({"type": "toast", "text": "Take discarded", "kind": "warn"})
+                self._toast("Take discarded", "warn")
                 self._reset_scene()
         elif name == "reset":
             rec.discard()
             self._replay = None
             self._reset_scene(kw.get("seed"))
-        elif name == "set_task":
-            task = kw.get("task")
-            if task in TASKS and task != self.env.task.name:
-                rec.discard()
-                self._replay = None
-                self._load_task(task)
-                self._ensure_preview_renderer()
-                self._emit({"type": "scene", "version": self.scene_version})
-                self._emit({"type": "toast", "text": f"Task: {task}", "kind": "info"})
         elif name == "set_mode":
             self.teleop.set_mode(kw.get("mode", "controllers"))
         elif name == "set_scale":
@@ -234,31 +252,19 @@ class Runtime:
                 frame = self._input
             if frame is not None:
                 self.placement.recenter(frame.head[:3], frame.head[3:])
-                for st in self.teleop.arms.values():
-                    st.clutch.release()
+                self.teleop.release_all()
         elif name == "set_operator":
             self.cfg.record.operator = str(kw.get("operator", "operator"))[:64]
         elif name == "set_auto_stop":
             rec.auto_stop = bool(kw.get("enabled", True))
         elif name == "replay":
-            self._start_replay(kw["path"])
+            if rec.state == RecState.IDLE:
+                _, data = read_episode(kw["path"], keys=["sim/state"])
+                self._replay = {"path": kw["path"], "states": data["sim/state"], "i": 0}
+                self._toast(f"Replaying {kw['path'].rsplit('/', 1)[-1]}")
         elif name == "replay_stop":
             self._replay = None
             self._reset_scene()
-
-    def _start_replay(self, path: str) -> None:
-        if self.recorder.state != RecState.IDLE:
-            return
-        meta, data = read_episode(path, keys=["sim/state"])
-        if meta.get("task") != self.env.task.name:
-            self._load_task(meta["task"])
-            self._emit({"type": "scene", "version": self.scene_version})
-        self._replay = {"path": path, "states": data["sim/state"], "i": 0, "success": meta.get("success")}
-        self._emit({"type": "toast", "text": f"Replaying {path.rsplit('/', 1)[-1]}", "kind": "info"})
-
-    def _haptic_both(self, intensity: float, ms: int) -> None:
-        for a in ARMS:
-            self._emit({"type": "haptic", "arm": a, "intensity": intensity, "ms": ms})
 
     def _tick(self, now: float) -> None:
         self._process_commands(now)
@@ -271,7 +277,7 @@ class Runtime:
             r["i"] += 1
             if r["i"] >= len(r["states"]):
                 self._replay = None
-                self._emit({"type": "toast", "text": "Replay finished", "kind": "info"})
+                self._toast("Replay finished")
                 self._reset_scene()
             self._publish(now, None)
             return
@@ -282,18 +288,23 @@ class Runtime:
         for cmd in out.commands:
             self._handle(cmd, {}, now)
         for arm, inten, ms in out.haptics:
-            self._emit({"type": "haptic", "arm": arm, "intensity": inten, "ms": ms})
+            self._haptic(arm, inten, ms)
+        for a in ARMS:
+            if out.engaged[a] != self._engaged[a]:
+                self._sound("engage" if out.engaged[a] else "disengage", a)
+        self._engaged = dict(out.engaged)
 
         for a in ARMS:
             p, R = out.targets[a]
             self.ik.set_target(a, p, mat_to_quat_wxyz(R))
+        self.ik.follow(env.data.qpos[env.arm_qadr])
         q_target = self.ik.solve()
 
         prev_state = self.recorder.state
-        self.recorder.tick(now, env)
+        self.recorder.tick(now)
         if prev_state == RecState.COUNTDOWN and self.recorder.recording:
             self._haptic_both(1.0, 120)
-            self._emit({"type": "toast", "text": "Recording", "kind": "rec"})
+            self._toast("Recording", "rec")
 
         recording = self.recorder.recording
         if recording:
@@ -305,16 +316,15 @@ class Runtime:
         if recording:
             step = self._build_step(obs, state, out, frame, q_target, success)
             if self.recorder.append(now, step, success):
-                self._emit({"type": "toast", "text": "Success! Save (X) or discard (B)", "kind": "success"})
-                self._haptic_both(0.5, 60)
+                self._toast("Success! Save (X) or discard (B)", "success")
 
         env.step()
-        self._check_warnings()
+        self._task_feedback(now, success)
+        self._check_warnings(now)
         self._publish(now, out, success)
 
     def _build_step(self, obs: dict, state: np.ndarray, out, frame: InputFrame | None, q_target,
                     success: bool) -> dict:
-        env = self.env
         ee_act = []
         for a in ARMS:
             p, R = out.targets[a]
@@ -333,28 +343,71 @@ class Runtime:
                 "joints": np.zeros((25, 7)) if h is None else h.joints,
                 "pinch": np.zeros(2) if h is None else h.pinch,
             }
-        step = {
-            "time": env.data.time,
+        return {
+            "time": self.env.data.time,
             "wall_time": time.monotonic(),
-            "obs": {k: obs[k] for k in ("joint_pos", "joint_vel", "gripper_width", "ee_pose_left",
-                                        "ee_pose_right", "objects")},
+            "obs": obs,
             "action": {
                 "joint_pos": np.concatenate([q_target[:7], g[:1], q_target[7:], g[1:]]),
                 "ee_pose": np.concatenate([ee_act[0], ee_act[1], g]),
-                "ctrl": env.data.ctrl.copy(),
             },
             "sim": {"state": state},
             "success": success,
+            "progress": self._progress,
+            "clutch": self.env.data.eq_active[self.env.clutch_eqs].copy(),
             "teleop": teleop,
         }
-        if self.cfg.record.live_images:
-            if self._record_renderer is None:
-                self._record_renderer = CameraRenderer(env.model, self.cfg.record.image_height,
-                                                       self.cfg.record.image_width, self.cfg.record.cameras)
-            step["images"] = self._record_renderer.render(env.data)
-        return step
 
-    def _check_warnings(self) -> None:
+    def _pattern(self, arm: str | None, pattern: tuple, now: float, sound: str | None = None) -> None:
+        intensity, ms, repeat, gap = pattern
+        for a in ARMS if arm is None else (arm,):
+            self._haptic(a, intensity, ms, repeat, gap)
+            self._quiet_until[a] = now + HAPTIC_QUIET_S
+        if sound:
+            self._sound(sound, arm)
+
+    def _task_feedback(self, now: float, success: bool) -> None:
+        """Haptics for grasp / hold / release, clicks, each correctly placed brick, and the finished tower."""
+        held = self.env.held()
+        for a in ARMS:
+            b, was = held[a], self._held[a]
+            if b is not None:
+                self._last_holder[b] = a
+            if b is not None and was is None:
+                self._pattern(a, HAPTIC_GRASP, now, "grasp")
+                self._hold_tick_at[a] = now + HOLD_TICK_S
+            elif b is None and was is not None:
+                self._pattern(a, HAPTIC_RELEASE, now, "release")
+            elif b is not None and now >= self._hold_tick_at[a]:
+                if now >= self._quiet_until[a]:
+                    self._haptic(a, *HAPTIC_HOLD_TICK)
+                self._hold_tick_at[a] = now + HOLD_TICK_S
+        self._held = held
+
+        progress = self.env.progress()
+        placed = range(self._progress + 1, progress + 1)  # a knocked-down level can fire again later
+        for level in placed:
+            self._pattern(self._last_holder[level], HAPTIC_PLACED, now, "placed")
+            self._toast(f"{BRICKS[level].label} placed ({level}/{LEVELS})", "success")
+        self._progress = progress
+        for kind, _lower, upper in self.env.clutch_events:
+            if kind == "lock" and upper not in placed:
+                self._pattern(self._last_holder[upper], HAPTIC_CLICK, now, "click")
+            elif kind == "unlock":
+                self._pattern(self._last_holder[upper], HAPTIC_UNCLICK, now, "unclick")
+
+        # Base brick set down (not held) inside the build area: a soft confirmation, once per placement.
+        base_in = self.env.in_area() and 0 not in held.values()
+        if base_in and not self._base_in_area:
+            self._sound("area", self._last_holder[0])
+            self._toast(f"{BRICKS[0].label} is in the build area", "info")
+        self._base_in_area = base_in
+
+        if success and not self._complete:
+            self._pattern(None, HAPTIC_COMPLETE, now, "complete")
+        self._complete = success
+
+    def _check_warnings(self, now: float) -> None:
         d = self.env.data
         left, right = self._arm_bodies["l"], self._arm_bodies["r"]
         geom_body = self.env.model.geom_bodyid
@@ -364,31 +417,29 @@ class Runtime:
                 arm_hit |= not (x in self._finger_bodies and y in self._finger_bodies)
             other = y if x == self._table_body else x if y == self._table_body else None
             table_hit |= other in left or other in right
-        ik_sat = any(e[0] > IK_WARN_M for e in self.ik.errors().values())
-        new = {"arm_collision": arm_hit, "table_collision": table_hit, "ik_saturated": ik_sat}
+        reach = {a: e[0] > IK_WARN_M for a, e in self.ik.errors().items()}
+        new = {"arm_collision": arm_hit, "table_collision": table_hit, "ik_saturated": any(reach.values())}
         for k, v in new.items():
             if v and not self._warn[k]:
                 self._haptic_both(0.3, 30)
-        self._warn = new
+        if arm_hit and not self._warn["arm_collision"]:
+            self._warn_sound("collision", None, now)
+        if table_hit and not self._warn["table_collision"]:
+            self._warn_sound("table", None, now)
+        for a in ARMS:
+            if reach[a] and not self._reach[a]:
+                self._warn_sound("out_of_reach", a, now)
+        self._warn, self._reach = new, reach
 
     def _publish(self, now: float, out, success: bool = False) -> None:
         env = self.env
-        ghosts = np.zeros((2, 7))
-        grippers = np.ones(2)
         flags = 0
         if out is not None:
-            for i, a in enumerate(ARMS):
-                p, R = out.targets[a]
-                ghosts[i, :3] = p
-                ghosts[i, 3:] = wxyz_to_xyzw(mat_to_quat_wxyz(R))
-            grippers = out.grippers
             flags |= FLAG_ENGAGED_L if out.engaged["l"] else 0
             flags |= FLAG_ENGAGED_R if out.engaged["r"] else 0
         if self.recorder.recording:
             flags |= FLAG_RECORDING
-        with self._input_lock:
-            t_echo = self._input.t_client if self._input is not None else 0.0
-        frame = pack_pose_frame(self._pose_seq + 1, _ms(), t_echo, body_poses(env.data), ghosts, grippers, flags)
+        frame = pack_pose_frame(self._pose_seq + 1, _ms(), body_poses(env.data), flags)
         with self._out_lock:
             self._pose_seq += 1
             self._pose_frame = frame
@@ -410,9 +461,8 @@ class Runtime:
         errs = self.ik.errors()
         status = {
             "type": "status",
-            "task": self.env.task.name,
-            "instruction": self.env.task.instruction,
-            "tasks": sorted(TASKS),
+            "task": TASK,
+            "instruction": INSTRUCTION,
             "mode": self.teleop.mode,
             "scale": self.teleop.scale,
             "rec_state": rec.state.value,
@@ -420,10 +470,14 @@ class Runtime:
             "elapsed": round(rec.elapsed(now), 2),
             "steps": len(rec.steps),
             "saved_count": rec.saved_count,
-            "last_saved": rec.last_saved,
             "auto_stop": rec.auto_stop,
             "success": bool(success),
             "success_seen": rec.success_seen,
+            "progress": self._progress,
+            "levels": LEVELS,
+            "in_area": self.env.in_area(),
+            "clicked": len(self.env.locked_pairs()),
+            "held": {a: (None if b is None else BRICKS[b].name) for a, b in self._held.items()},
             "operator": self.cfg.record.operator,
             "engaged": {a: bool(out.engaged[a]) for a in ARMS} if out else {a: False for a in ARMS},
             "tracked": {a: bool(out.tracked[a]) for a in ARMS} if out else {a: False for a in ARMS},
@@ -431,18 +485,16 @@ class Runtime:
             "sources": {a: (frame.hand(a).source if frame is not None and input_age < 1.0 else 0) for a in ARMS},
             "grippers": out.grippers.round(3).tolist() if out else [1.0, 1.0],
             "ik_error_mm": {a: round(e[0] * 1000, 1) for a, e in errs.items()},
+            "out_of_reach": {a: bool(e[0] > IK_WARN_M) for a, e in errs.items()},
             "ee_pos": {a: self.env.data.site_xpos[sid].round(4).tolist() for a, sid in zip(ARMS, self.env.tcp_sites)},
             "warnings": dict(self._warn),
             "input_hz": round(rate, 1),
             "rtt_ms": round(self._rtt_ms, 1) if rate > 0 else None,
             "loop_hz": round(self._loop_hz, 1),
             "connected": rate > 0,
-            "sim_time": round(self.env.data.time, 2),
-            "scene_version": self.scene_version,
-            "placement": self.placement.to_dict()["matrix"],
+            "placement": self.placement.column_major(),
             "replay": None if self._replay is None else {
                 "path": self._replay["path"], "i": self._replay["i"], "n": len(self._replay["states"])},
         }
         with self._out_lock:
             self._status = status
-

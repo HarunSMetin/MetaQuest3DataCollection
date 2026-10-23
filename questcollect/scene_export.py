@@ -8,10 +8,11 @@ are deduplicated and large meshes are decimated (the Quest renders ~80k triangle
 
 from __future__ import annotations
 
+import fast_simplification
 import mujoco
 import numpy as np
 
-from questcollect.teleop.frames import wxyz_to_xyzw
+from questcollect.frames import wxyz_to_xyzw
 
 GT = mujoco.mjtGeom
 GEOM_TYPES = {int(k): v for k, v in {
@@ -19,7 +20,7 @@ GEOM_TYPES = {int(k): v for k, v in {
     GT.mjGEOM_ELLIPSOID: "ellipsoid", GT.mjGEOM_CYLINDER: "cylinder", GT.mjGEOM_BOX: "box",
     GT.mjGEOM_MESH: "mesh",
 }.items()}
-VISIBLE_GROUPS = (0, 1, 2)
+VISIBLE_GROUPS = (0, 1, 2, 5)  # 5: operator-only visuals (grasp-point markers), not in camera renders
 DECIMATE_ABOVE_FACES = 1500
 DECIMATE_REDUCTION = 0.7
 
@@ -35,10 +36,6 @@ def _weld(verts: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]
 def _decimate(verts: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     verts, faces = _weld(verts, faces)
     if len(faces) <= DECIMATE_ABOVE_FACES:
-        return verts, faces
-    try:
-        import fast_simplification
-    except ImportError:
         return verts, faces
     v, f = fast_simplification.simplify(verts.astype(np.float32), faces.astype(np.int32),
                                         target_reduction=DECIMATE_REDUCTION)

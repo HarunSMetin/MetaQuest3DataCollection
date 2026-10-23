@@ -22,6 +22,7 @@ certs/
 *.hdf5
 *.tmp
 *.log
+MUJOCO_LOG.TXT
 .env
 
 # Personal notes (machine-specific paths / IPs)

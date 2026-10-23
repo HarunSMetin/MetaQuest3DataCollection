@@ -17,8 +17,6 @@ import typer
 from questcollect.config import ROOT, load_config
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Quest 3 -> MuJoCo bimanual teleop & data collection")
-export_app = typer.Typer(no_args_is_help=True, help="Convert raw episodes to training formats")
-app.add_typer(export_app, name="export")
 
 
 def _headless_gl() -> None:
@@ -39,8 +37,7 @@ def lan_ip() -> str:
 
 @app.command()
 def serve(
-    config: Optional[Path] = typer.Option(None, help="YAML config (default: config/default.yaml)"),
-    task: Optional[str] = typer.Option(None, help="Override the task"),
+    config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
     mode: Optional[str] = typer.Option(None, help="controllers | hands"),
     https: bool = typer.Option(True, help="Also serve HTTPS for Wi-Fi (needs `qc certs`)"),
 ):
@@ -49,12 +46,10 @@ def serve(
     import uvicorn
 
     from questcollect.runtime import Runtime
-    from questcollect.server.app import create_app
+    from questcollect.server import create_app
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config)
-    if task:
-        cfg.task = task
     if mode:
         cfg.teleop.mode = mode
     runtime = Runtime(cfg)
@@ -129,15 +124,13 @@ def setup_quest():
 
 
 @app.command()
-def view(task: Optional[str] = typer.Option(None)):
+def view():
     """Open the scene in MuJoCo's native viewer (sanity check, no headset)."""
-    import mujoco
     import mujoco.viewer
 
-    from questcollect.sim.env import BimanualEnv
+    from questcollect.sim import BimanualEnv
 
-    cfg = load_config()
-    env = BimanualEnv(cfg, task)
+    env = BimanualEnv(load_config())
     env.reset()
     mujoco.viewer.launch(env.model, env.data)
 
@@ -147,11 +140,11 @@ def replay(path: Path, speed: float = typer.Option(1.0)):
     """Play back a raw episode's recorded states in MuJoCo's native viewer."""
     import mujoco.viewer
 
-    from questcollect.record.hdf5_io import read_episode
-    from questcollect.sim.env import BimanualEnv
+    from questcollect.recorder import read_episode
+    from questcollect.sim import BimanualEnv
 
     meta, data = read_episode(path, keys=["sim/state"])
-    env = BimanualEnv(load_config(), meta["task"])
+    env = BimanualEnv(load_config())
     states = data["sim/state"]
     dt = 1.0 / meta["fps"] / speed
     with mujoco.viewer.launch_passive(env.model, env.data) as v:
@@ -166,7 +159,7 @@ def replay(path: Path, speed: float = typer.Option(1.0)):
 @app.command()
 def inspect(path: Path):
     """Print an episode's metadata and dataset shapes."""
-    from questcollect.record.hdf5_io import read_episode
+    from questcollect.recorder import read_episode
 
     meta, data = read_episode(path)
     for k, v in meta.items():
@@ -178,23 +171,23 @@ def inspect(path: Path):
         typer.echo(f"{k:<32} {str(data[k].shape):<18} {data[k].dtype}")
 
 
-@export_app.command("lerobot")
-def export_lerobot(
-    raw: Path = typer.Option(ROOT / "data" / "raw", help="Raw episode dir (or a task subdir)"),
-    out: Path = typer.Option(..., help="Output LeRobot dataset root"),
+@app.command()
+def export(
+    out: Path = typer.Option(ROOT / "data" / "lerobot", help="Output LeRobot dataset root"),
+    raw: Optional[Path] = typer.Option(None, help="Episode folder (default: record.out_dir from the config)"),
     repo_id: str = typer.Option("local/quest_bimanual_panda"),
-    task: Optional[str] = typer.Option(None, help="Only this task"),
     action: str = typer.Option("joint", help="joint | ee"),
     height: int = typer.Option(480),
     width: int = typer.Option(640),
     include_failures: bool = typer.Option(False),
+    randomize_visuals: bool = typer.Option(False, help="Vary lighting, colours and camera mounts per episode"),
 ):
-    """Raw HDF5 -> LeRobotDataset (cameras re-rendered from recorded sim states)."""
+    """Episodes -> LeRobot dataset (cameras re-rendered from recorded sim states). Needs `uv sync --extra export`."""
     _headless_gl()
-    from questcollect.export.to_lerobot import export
+    from questcollect.lerobot_export import export as export_lerobot
 
-    n = export(raw, out, repo_id, task=task, action=action, height=height, width=width,
-               include_failures=include_failures)
+    n = export_lerobot(raw or load_config().out_dir, out, repo_id, action=action, height=height, width=width,
+                       include_failures=include_failures, randomize_visuals=randomize_visuals)
     typer.secho(f"exported {n} episodes to {out}", fg="green")
 
 
@@ -204,8 +197,7 @@ def doctor():
     _headless_gl()
     import mujoco
 
-    from questcollect.sim.env import BimanualEnv
-    from questcollect.sim.scene import PANDA_XML
+    from questcollect.sim import PANDA_XML, BimanualEnv
 
     def row(ok: bool, label: str, hint: str = ""):
         typer.secho(f"  {'✓' if ok else '✗'} {label}" + (f"  — {hint}" if hint and not ok else ""),

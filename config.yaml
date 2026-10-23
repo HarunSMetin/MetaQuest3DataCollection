@@ -1,22 +1,20 @@
-# QuestCollect default configuration.
+# QuestCollect settings. Pass another file with `qc serve --config my.yaml`.
 
 sim:
   physics_dt: 0.002          # 500 Hz physics
   control_hz: 50             # control + recording rate
-  publish_hz: 60             # pose stream to headset / dashboard
   table_height: 0.75
   arm_spacing: 0.6           # distance between the two arm bases (m)
-
-task: transfer_cube
+  gripper_force: 40          # N squeeze when closed on an object (real Franka Hand: <= 70 N continuous)
 
 teleop:
   mode: controllers          # controllers | hands
-  scale: 1.0                 # hand motion -> EE motion
+  scale: 1.0                 # hand motion -> end-effector motion
   pinch_open_m: 0.08         # thumb-index distance mapped to fully open gripper
   pinch_closed_m: 0.015      # thumb-index distance mapped to closed gripper
   filter_min_cutoff: 1.5     # One-Euro filter params
   filter_beta: 0.5
-  workspace_min: [0.05, -0.65, 0.76]
+  workspace_min: [0.05, -0.65, 0.755]  # z: a DUPLO grasp sits ~1 cm above the table
   workspace_max: [0.95, 0.65, 1.45]
 
 ik:
@@ -24,16 +22,15 @@ ik:
   orientation_cost: 0.6
   posture_cost: 0.01
   max_joint_vel: 2.5         # rad/s
+  max_lead: 0.15             # rad the IK may run ahead of the measured joints (no windup when an arm is blocked)
+  avoid_arm_collisions: false  # true: IK keeps the arms collision_margin apart; false: they really collide
   collision_margin: 0.03     # min distance between the two arms (m)
   iterations: 2
 
 record:
-  out_dir: data/raw
+  out_dir: data/episodes
   countdown_s: 3
   cameras: [cam_high, cam_low, cam_left_wrist, cam_right_wrist]
-  live_images: false         # store images while recording (exporter re-renders from state otherwise)
-  image_height: 480
-  image_width: 640
   operator: operator
 
 server:

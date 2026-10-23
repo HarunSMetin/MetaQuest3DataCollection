@@ -4,16 +4,10 @@ import numpy as np
 import pytest
 
 from questcollect.config import TeleopConfig
-from questcollect.server.protocol import (
-    SRC_CONTROLLER, SRC_HAND, HandInput, InputFrame, pack_input, parse_input,
-)
-from questcollect.teleop.arm_mapper import ArmClutch
-from questcollect.teleop.filters import OneEuro, OneEuroRotation
-from questcollect.teleop.frames import (
-    Placement, mat_to_quat_wxyz, quat_wxyz_to_mat, wxyz_to_xyzw, xyzw_to_wxyz,
-)
-from questcollect.teleop.hand_mapper import HandMapper
-from questcollect.teleop.teleop import Teleop
+from questcollect.frames import Placement, mat_to_quat_wxyz, quat_wxyz_to_mat, wxyz_to_xyzw, xyzw_to_wxyz
+from questcollect.protocol import (FLAG_ENGAGED_R, SRC_CONTROLLER, SRC_HAND, HandInput, InputFrame, pack_input,
+                                  pack_pose_frame, parse_input)
+from questcollect.teleop import ArmClutch, HandMapper, OneEuro, OneEuroRotation, Teleop
 
 
 def random_rot(rng):
@@ -143,12 +137,26 @@ def test_teleop_controller_follow_and_hold():
     assert out.engaged["r"]
     assert np.allclose(out.targets["r"][0] - p0, [0, -0.1, -0.1], atol=1e-3)
     assert out.grippers[1] == pytest.approx(0.0)
-    # Release and move: target holds.
+    # Letting go of Grip keeps following (it's a toggle); a second press disengages and the target holds.
     out = t.update(controller_frame(x=0.3, y=1.0), time.monotonic(), 0.02)
+    assert out.engaged["r"]
+    out = t.update(controller_frame(x=0.3, y=1.0, squeeze=1.0), time.monotonic(), 0.02)
     held = out.targets["r"][0].copy()
     for k in range(1, 31):
         out = t.update(controller_frame(x=0.3 + 0.01 * k, y=1.0 - 0.01 * k), time.monotonic(), 0.02)
     assert not out.engaged["r"] and np.allclose(out.targets["r"][0], held)
+
+
+def test_controller_grip_toggles_clutch():
+    t = make_teleop()
+    engaged = lambda sq: t.update(controller_frame(squeeze=sq), time.monotonic(), 0.02).engaged["r"]  # noqa: E731
+    assert not engaged(0.0)
+    assert engaged(0.7)        # press -> on
+    assert engaged(0.5)        # still held (hysteresis): no re-toggle
+    assert engaged(0.0)        # released: stays on
+    assert not engaged(1.0)    # press again -> off
+    assert not engaged(0.0)
+    assert engaged(1.0)        # and on again
 
 
 def test_teleop_stale_input_disengages():
@@ -165,9 +173,11 @@ def test_teleop_jump_rejection():
     for _ in range(3):
         out = t.update(controller_frame(squeeze=1.0), time.monotonic(), 0.02)
     p0 = out.targets["r"][0].copy()
-    out = t.update(controller_frame(x=0.8, squeeze=1.0), time.monotonic(), 0.02)  # 60 cm in one tick
+    out = t.update(controller_frame(x=0.8), time.monotonic(), 0.02)  # 60 cm in one tick
     assert not out.engaged["r"]
     assert np.allclose(out.targets["r"][0], p0)
+    out = t.update(controller_frame(x=0.8), time.monotonic(), 0.02)
+    assert not out.engaged["r"], "after a glitch the arm stays off until Grip is pressed again"
 
 
 def test_teleop_mode_mismatch():
@@ -189,12 +199,14 @@ def test_workspace_clamp():
 
 def test_protocol_roundtrip():
     f = controller_frame(squeeze=0.7, trigger=0.3)
-    f.seq, f.t_client, f.t_echo = 42, 1234.5, 999.25
+    f.seq, f.t_echo = 42, 999.25
     f.left = hand_input(pinch_index=0.02)
     g = parse_input(pack_input(f))
-    assert g.seq == 42 and g.t_client == 1234.5 and g.t_echo == 999.25
+    assert g.seq == 42 and g.t_echo == 999.25
     assert g.left.source == SRC_HAND and g.right.source == SRC_CONTROLLER
     assert np.allclose(g.right.buttons[:2], [0.3, 0.7], atol=1e-6)
     assert np.allclose(g.left.pinch[0], 0.02, atol=1e-6)
     with pytest.raises(ValueError):
         parse_input(b"\x01" * 10)
+    frame = pack_pose_frame(7, 123.5, np.zeros((5, 7)), FLAG_ENGAGED_R)
+    assert len(frame) == 16 + 5 * 7 * 4 and frame[1] == FLAG_ENGAGED_R  # header + body poses, nothing else

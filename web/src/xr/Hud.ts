@@ -1,7 +1,7 @@
 // World-anchored heads-up display above the far edge of the table.
 
-import type { Status } from "../../protocol";
-import { SRC_CONTROLLER, SRC_HAND } from "../../protocol";
+import type { Status } from "../protocol";
+import { SRC_CONTROLLER, SRC_HAND } from "../protocol";
 import { glass, Panel, roundRect, text, THEME, wrapText } from "./Panel";
 
 const W = 0.95, H = 0.34;
@@ -14,7 +14,6 @@ function fmtTime(s: number) {
 export class Hud {
   readonly panel: Panel;
   status: Status | null = null;
-  rttMs: number | null = null;
   toast: { text: string; kind: string; until: number } | null = null;
 
   constructor() {
@@ -73,7 +72,7 @@ export class Hud {
 
     // --- task + instruction ---------------------------------------------------------
     const tx = px + pillW + 40;
-    text(g, s.task.replace(/_/g, " ").toUpperCase(), tx, py + 26, 34, { weight: 800, color: THEME.text });
+    text(g, `${s.task.replace(/_/g, " ").toUpperCase()}  ·  ${s.progress}/${s.levels}`, tx, py + 26, 34, { weight: 800, color: THEME.text });
     wrapText(g, s.instruction, tx, py + 74, w - tx - 290, 38, 29, THEME.dim, 3);
 
     // --- stats column -----------------------------------------------------------------
@@ -84,7 +83,7 @@ export class Hud {
     };
     stat("EPISODES", `${s.saved_count}`, py + 22);
     stat("MODE", s.mode === "controllers" ? "CTRL" : "HANDS", py + 66, THEME.accent);
-    const rtt = this.rttMs ?? s.rtt_ms;
+    const rtt = s.rtt_ms;
     stat("LATENCY", rtt != null ? `${Math.round(rtt)} ms` : "—", py + 110, rtt != null && rtt > 60 ? THEME.warn : THEME.ok);
     stat("INPUT", `${Math.round(s.input_hz)} Hz`, py + 154);
 
@@ -94,7 +93,7 @@ export class Hud {
       text(g, "✓  Task solved", tx, hy, 34, { color: THEME.ok, weight: 800 });
     } else if (s.rec_state === "idle" && !s.replay) {
       const hint = s.mode === "controllers"
-        ? "Hold GRIP to move  ·  TRIGGER closes gripper  ·  Y opens menu"
+        ? "GRIP toggles control  ·  TRIGGER closes gripper  ·  Y opens menu"
         : "Thumb+middle pinch to engage  ·  thumb+index = gripper  ·  palm up = menu";
       text(g, hint, tx, hy, 24, { color: THEME.dim, weight: 600 });
     }

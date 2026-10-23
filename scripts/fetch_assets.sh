@@ -8,5 +8,5 @@ if [ -d "$DEST/franka_emika_panda" ]; then
 fi
 mkdir -p "$ROOT/assets/third_party"
 git clone --depth 1 --filter=blob:none --sparse https://github.com/google-deepmind/mujoco_menagerie.git "$DEST"
-git -C "$DEST" sparse-checkout set franka_emika_panda franka_fr3
+git -C "$DEST" sparse-checkout set franka_emika_panda
 echo "done: $DEST"

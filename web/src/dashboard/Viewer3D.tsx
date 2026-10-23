@@ -1,15 +1,15 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { PoseFrame } from "../protocol";
-import { MujocoScene } from "../scene/MujocoScene";
+import type { PoseFrame, Status } from "../protocol";
+import { MujocoScene } from "../MujocoScene";
 
 // MuJoCo z-up world -> three.js y-up (same basis change the headset uses, without room placement).
 const Z_UP_TO_Y_UP = new THREE.Matrix4().makeBasis(
   new THREE.Vector3(0, 0, -1), new THREE.Vector3(-1, 0, 0), new THREE.Vector3(0, 1, 0),
 );
 
-export interface ViewerHandle { push: (f: PoseFrame) => void; reload: () => void }
+export interface ViewerHandle { push: (f: PoseFrame) => void; reload: () => void; status: (s: Status) => void }
 
 export function Viewer3D({ handle }: { handle: React.MutableRefObject<ViewerHandle | null> }) {
   const host = useRef<HTMLDivElement>(null);
@@ -36,12 +36,12 @@ export function Viewer3D({ handle }: { handle: React.MutableRefObject<ViewerHand
 
     const mj = new MujocoScene({ shadows: true });
     mj.setPlacement(Z_UP_TO_Y_UP.toArray());
-    scene.add(mj.root);
-    mj.load();
+    scene.add(mj.root);  // App calls reload() once the websocket connects
 
     handle.current = {
       push: (f) => mj.pushFrame(f, performance.now()),
       reload: () => { mj.load(); },
+      status: (s) => mj.setOutOfReach(s.out_of_reach),
     };
 
     const resize = () => {

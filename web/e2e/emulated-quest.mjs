@@ -46,12 +46,17 @@ check(s.tracked.l && s.tracked.r, "both arms tracked");
 check(s.input_hz > 20, `input stream rate ${s.input_hz} Hz`);
 check(s.rtt_ms !== null && s.rtt_ms < 100, `server-measured RTT ${s.rtt_ms} ms`);
 
-// Engage right arm with grip, move controller 10 cm right and 10 cm down.
+// Grip press (and release) toggles the right arm on; move controller 10 cm right and 10 cm down.
 const r0 = s.ee_pos.r;
-await page.evaluate(() => window.__xr.controllers.right.updateButtonValue("squeeze", 1));
-await sleep(400);
+const tapGrip = async () => {
+  await page.evaluate(() => window.__xr.controllers.right.updateButtonValue("squeeze", 1));
+  await sleep(150);
+  await page.evaluate(() => window.__xr.controllers.right.updateButtonValue("squeeze", 0));
+  await sleep(250);
+};
+await tapGrip();
 s = await status();
-check(s.engaged.r && !s.engaged.l, "grip engages only the right arm");
+check(s.engaged.r && !s.engaged.l, "grip press engages only the right arm, and it stays engaged");
 for (let i = 1; i <= 20; i++) {
   await page.evaluate((k) => window.__xr.controllers.right.position.set(0.2 + 0.005 * k, 1.1 - 0.005 * k, -0.35), i);
   await sleep(40);
@@ -65,10 +70,10 @@ await page.evaluate(() => window.__xr.controllers.right.updateButtonValue("trigg
 await sleep(600);
 s = await status();
 check(s.grippers[1] < 0.05, `trigger closes right gripper (cmd=${s.grippers[1]})`);
-await page.evaluate(() => { const c = window.__xr.controllers.right; c.updateButtonValue("trigger", 0); c.updateButtonValue("squeeze", 0); });
-await sleep(300);
+await page.evaluate(() => window.__xr.controllers.right.updateButtonValue("trigger", 0));
+await tapGrip();
 s = await status();
-check(!s.engaged.r, "releasing grip disengages");
+check(!s.engaged.r, "second grip press disengages");
 
 // Record with A, stop with A, save with X.
 const press = async (side, btn) => {

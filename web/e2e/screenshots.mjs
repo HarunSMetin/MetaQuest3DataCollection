@@ -32,7 +32,7 @@ await xr.evaluate(() => {
 });
 await xr.click("#enter-vr");
 await sleep(3000); // auto-recenter runs 1.2 s after entering
-await xr.evaluate(() => window.__xr.controllers.right.updateButtonValue("squeeze", 1)); // engage: ghost glows
+await xr.evaluate(() => window.__xr.controllers.right.updateButtonValue("squeeze", 1)); // engage (toggle): grasp-point marker brightens
 await xr.evaluate(() => window.__xr.controllers.left.updateButtonValue("y-button", 1)); // wrist menu
 await sleep(300);
 await xr.evaluate(() => window.__xr.controllers.left.updateButtonValue("y-button", 0));

@@ -1,13 +1,15 @@
 // QuestCollect WebXR client: renders the MuJoCo mirror, streams head/hands/controllers, in-VR UI.
 
 import * as THREE from "three";
-import "../styles/xr.css";
+import "./xr.css";
 import { Link } from "../net";
-import { B_SECONDARY, B_TRIGGER, InputPacker, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status } from "../protocol";
-import { ARM_COLORS, MujocoScene } from "../scene/MujocoScene";
+import { B_SECONDARY, B_TRIGGER, fetchTask, InputPacker, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status } from "../protocol";
+import { ARM_COLORS, MujocoScene } from "../MujocoScene";
 import { type Side, XRInputSampler } from "./input";
-import { Hud } from "./ui/Hud";
-import { WristMenu } from "./ui/WristMenu";
+import { GoalPanel } from "./GoalPanel";
+import { Hud } from "./Hud";
+import { Sounds } from "./sounds";
+import { WristMenu } from "./WristMenu";
 import { HandViz, Pointer } from "./visuals";
 
 // ---------------------------------------------------------------------------------------------
@@ -60,6 +62,18 @@ hud.panel.mesh.matrix
   .setPosition(1.02, 0, 0.75 + 0.6);
 mj.root.add(hud.panel.mesh);
 
+// Goal panel to the left of the HUD (operator's view), turned a little towards the operator.
+const goal = new GoalPanel();
+goal.panel.mesh.matrixAutoUpdate = false;
+goal.panel.mesh.matrix
+  .makeRotationZ(0.3)
+  .multiply(new THREE.Matrix4().makeBasis(new THREE.Vector3(0, -1, 0), new THREE.Vector3(0, 0, 1), new THREE.Vector3(-1, 0, 0)))
+  .multiply(new THREE.Matrix4().makeRotationX(-0.18))
+  .setPosition(0.98, 0.67, 0.75 + 0.6);
+mj.root.add(goal.panel.mesh);
+
+const sounds = new Sounds();
+
 const sampler = new XRInputSampler();
 const handViz: Record<Side, HandViz> = { left: new HandViz(ARM_COLORS.l), right: new HandViz(ARM_COLORS.r) };
 const pointers: Record<Side, Pointer> = { left: new Pointer(ARM_COLORS.l), right: new Pointer(ARM_COLORS.r) };
@@ -69,48 +83,37 @@ for (const s of ["left", "right"] as Side[]) scene.add(handViz[s].group, pointer
 // Networking
 
 let status: Status | null = null;
-let sceneVersion = -1;
 let lastServerT = 0;
-let rttMs: number | null = null;
 const packer = new InputPacker();
 
 const link = new Link("/ws/xr", {
   onPose: (f) => {
     mj.pushFrame(f, performance.now());
     lastServerT = f.tServer;
-    if (f.tEcho > 0) {
-      const r = performance.now() - f.tEcho;
-      rttMs = rttMs == null ? r : 0.9 * rttMs + 0.1 * r;
-    }
   },
   onStatus: (s) => {
     status = s;
-    if (s.scene_version !== sceneVersion) loadScene(s.scene_version);
     mj.setPlacement(s.placement);
-    hud.rttMs = rttMs;
+    mj.setOutOfReach(s.out_of_reach);
     hud.update(s);
+    goal.update(s);
     menu.update(s);
     updateLanding();
   },
   onEvent: (e: ServerEvent) => {
-    if (e.type === "haptic") sampler.pulse(e.arm === "l" ? "left" : "right", e.intensity, e.ms);
+    if (e.type === "haptic") {
+      const side = e.arm === "l" ? "left" : "right";
+      for (let i = 0; i < (e.repeat ?? 1); i++) {
+        setTimeout(() => sampler.pulse(side, e.intensity, e.ms), i * (e.ms + (e.gap_ms ?? 0)));
+      }
+    }
     else if (e.type === "toast") { hud.showToast(e.text, e.kind); toastDom(e.text, e.kind); }
+    else if (e.type === "sound") sounds.play(e.name, e.arm);
   },
-  onOpen: () => updateLanding(),
+  // (Re)load the scene on every connect, so a restarted server with a changed scene is picked up.
+  onOpen: () => { mj.load(); fetchTask().then((t) => goal.setTask(t)).catch(() => {}); updateLanding(); },
   onClose: () => { status = null; updateLanding(); },
 });
-
-let loading = false;
-async function loadScene(version: number) {
-  if (loading) return;
-  loading = true;
-  try {
-    await mj.load();
-    sceneVersion = version;
-  } finally {
-    loading = false;
-  }
-}
 
 // ---------------------------------------------------------------------------------------------
 // Wrist menu + interaction
@@ -118,6 +121,8 @@ async function loadScene(version: number) {
 const menu = new WristMenu({
   command: (name, args) => link.command(name, args),
   exit: () => renderer.xr.getSession()?.end(),
+  toggleSound: () => sounds.toggle(),
+  soundOn: () => sounds.enabled,
 });
 scene.add(menu.panel.mesh);
 
@@ -218,7 +223,7 @@ renderer.setAnimationLoop((_t, frame?: XRFrame) => {
     sampler.sample(frame, ref);
     placeMenu();
     interact();
-    link.sendBinary(packer.pack(sampler.head, sampler.hands.left, sampler.hands.right, now, lastServerT));
+    link.sendBinary(packer.pack(sampler.head, sampler.hands.left, sampler.hands.right, lastServerT));
     handViz.left.update(sampler.hands.left, sampler.radii.left, mj.engaged.l);
     handViz.right.update(sampler.hands.right, sampler.radii.right, mj.engaged.r);
   } else {
@@ -229,6 +234,7 @@ renderer.setAnimationLoop((_t, frame?: XRFrame) => {
   }
   mj.update(now);
   hud.tick();
+  goal.tick();
   if (menu.visible) menu.panel.redraw();
   renderer.render(scene, camera);
 });
@@ -253,6 +259,7 @@ function setPassthrough(on: boolean) {
 
 async function enterXR(mode: "vr" | "ar") {
   if (!navigator.xr) return;
+  sounds.unlock(); // audio may only start from this click
   const session = await navigator.xr.requestSession(mode === "vr" ? "immersive-vr" : "immersive-ar", {
     requiredFeatures: ["local-floor"],
     optionalFeatures: ["hand-tracking"],
@@ -286,7 +293,6 @@ async function initLanding() {
   for (const el of document.querySelectorAll<HTMLButtonElement>("[data-mode]")) {
     el.onclick = () => link.command("set_mode", { mode: el.dataset.mode });
   }
-  $<HTMLSelectElement>("task").onchange = (e) => link.command("set_task", { task: (e.target as HTMLSelectElement).value });
 }
 
 function updateLanding() {
@@ -295,9 +301,6 @@ function updateLanding() {
   $("conn").textContent = link.open ? (s ? "Server connected" : "Connecting…") : "Server offline";
   if (!s) return;
   for (const el of document.querySelectorAll<HTMLButtonElement>("[data-mode]")) el.classList.toggle("active", el.dataset.mode === s.mode);
-  const sel = $<HTMLSelectElement>("task");
-  if (sel.options.length !== s.tasks.length) sel.innerHTML = s.tasks.map((t) => `<option value="${t}">${t.replace(/_/g, " ")}</option>`).join("");
-  sel.value = s.task;
   $("instruction").textContent = s.instruction;
   $("saved").textContent = String(s.saved_count);
 }
@@ -315,4 +318,4 @@ initLanding();
 updateLanding();
 
 // Debug handle for automated tests and the browser console.
-(window as unknown as { __qc: unknown }).__qc = { sampler, mj, link, renderer, hud, menu };
+(window as unknown as { __qc: unknown }).__qc = { sampler, mj, link, renderer, hud, goal, menu, sounds };

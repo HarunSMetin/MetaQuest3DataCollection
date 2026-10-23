@@ -80,6 +80,10 @@ class Placement:
         T[:3, 3] = self.t
         return T
 
+    def column_major(self) -> list[float]:
+        """4x4 world -> xr matrix in three.js (column-major) order."""
+        return self.matrix().T.flatten().tolist()
+
     def recenter(self, head_pos, head_quat_xyzw) -> None:
         """Put the operator's head behind the arm bases, looking along world +x."""
         R_head = quat_wxyz_to_mat(xyzw_to_wxyz(head_quat_xyzw))
@@ -103,6 +107,3 @@ class Placement:
 
     def world_point_from_xr(self, pos) -> np.ndarray:
         return self.R.T @ (np.asarray(pos, float) - self.t)
-
-    def to_dict(self) -> dict:
-        return {"matrix": self.matrix().T.flatten().tolist()}  # column-major for three.js

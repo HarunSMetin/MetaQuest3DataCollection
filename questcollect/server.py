@@ -14,8 +14,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from questcollect.config import ROOT
+from questcollect.protocol import parse_input
 from questcollect.runtime import Runtime
-from questcollect.server.protocol import parse_input
 
 log = logging.getLogger(__name__)
 WEB_DIST = ROOT / "web" / "dist"
@@ -60,6 +60,10 @@ def create_app(runtime: Runtime) -> FastAPI:
     async def scene_bin():
         _, blob = runtime.scene()
         return Response(blob, media_type="application/octet-stream", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/task")
+    async def task():
+        return JSONResponse(runtime.task(), headers={"Cache-Control": "no-store"})
 
     @app.get("/api/status")
     async def status():
