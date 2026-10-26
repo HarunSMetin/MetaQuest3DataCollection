@@ -134,6 +134,13 @@ export interface Status {
   connected: boolean;
   placement: number[]; // column-major 4x4, world -> xr
   replay: { path: string; i: number; n: number } | null;
+  /** Who drives the arms (runtime.py CONTROL_MODES); `policy` is null unless `qc serve --policy` loaded one. */
+  control: {
+    mode: "teleop" | "policy" | "shared";
+    driver: "operator" | "policy";
+    policy: string | null;
+    safety_rad: number; // how much the safety filter changed the policy's last joint targets
+  };
 }
 
 export type ServerEvent =
@@ -168,4 +175,13 @@ export interface EpisodeRow {
   input_mode: string;
   operator: string;
   created_at: string;
+  source: "teleop" | "policy" | "shared";
 }
+
+/** GET /api/audit (questcollect/audit.py): per episode file, its quality and whether training datasets use it. */
+export type AuditRows = Record<string, {
+  contact_frac: { link_table: number; arm_arm: number; tip_table: number };
+  idle_frac: number;
+  excluded: boolean; // excluded by hand (curation.json)
+  verdict: string | null; // why a dataset would leave it out; null = used
+}>;

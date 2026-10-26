@@ -7,7 +7,7 @@ One HDF5 file per episode (data/episodes/episode_XXXXXX.hdf5). Keys are dataset 
 meta (file attrs): schema_version, task, instruction, operator, input_mode, success, fps, seed,
                    created_at, duration_s, num_steps, model_xml, config_yaml, camera_names, objects,
                    tower (JSON: bricks bottom-up with studs/height/color/mass, per-level offsets, clutch
-                   pairs and limits)
+                   pairs and limits), scene_hash (sim.scene_hash; v5+), source (teleop | policy | shared; v5+)
 
 /time                         (T,)        sim time [s]
 /wall_time                    (T,)        host monotonic time [s]
@@ -25,6 +25,9 @@ meta (file attrs): schema_version, task, instruction, operator, input_mode, succ
 /success                      (T,)        task success predicate per step (tower complete and released)
 /progress                     (T,)        bricks correctly stacked and clicked in on the base so far (0..3)
 /clutch                       (T, 6)      which brick pairs are clicked together (order = meta tower.clutch_pairs)
+/contacts                     (T, 3)      [arm link on table, arms touching, hand/fingertip on table] (v5+;
+                                          BimanualEnv.contact_flags; older files: audit.py replays sim/state)
+/control/source               (T,)        who drove this step: 0 operator, 1 policy (v5+)
 /teleop/head                  (T, 7)      XR head pose [x y z qx qy qz qw]
 /teleop/{left,right}/source   (T,)        0 none, 1 controller, 2 hand
 /teleop/{left,right}/pose     (T, 7)      raw XR control pose
@@ -41,6 +44,7 @@ Camera images are not stored: sim/state replays the episode exactly, and the exp
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
@@ -50,11 +54,58 @@ import h5py
 import numpy as np
 import yaml
 
+from questcollect.protocol import InputFrame
 from questcollect.sim import (BRICK_H, BRICKS, CLUTCH_PAIRS, CLUTCH_PRESS_N, CLUTCH_PULL_N, INSTRUCTION, OBJECTS, PITCH,
                               TASK, TOWER)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 AUTO_STOP_TAIL_S = 1.0
+SOURCE_OPERATOR, SOURCE_POLICY = 0, 1
+
+
+# -- one step --------------------------------------------------------------------------------------
+def teleop_fields(frame: InputFrame | None, engaged=(False, False), tracked=(False, False),
+                  rtt_ms: float = 0.0) -> dict:
+    """The raw operator input of one step (all zeros without a headset, e.g. a policy rollout)."""
+    out = {"head": np.zeros(7) if frame is None else frame.head, "engaged": np.array(engaged, bool),
+           "tracked": np.array(tracked, bool), "rtt_ms": rtt_ms}
+    for side, a in (("left", "l"), ("right", "r")):
+        h = None if frame is None else frame.hand(a)
+        out[side] = {
+            "source": 0 if h is None else h.source,
+            "pose": np.zeros(7) if h is None else h.pose,
+            "buttons": np.zeros(8) if h is None else h.buttons,
+            "joints": np.zeros((25, 7)) if h is None else h.joints,
+            "pinch": np.zeros(2) if h is None else h.pinch,
+        }
+    return out
+
+
+def make_step(env, obs: dict, state: np.ndarray, q_target: np.ndarray, grippers: np.ndarray, ee_targets,
+              success: bool, progress: int, contacts: np.ndarray, teleop: dict,
+              source: int = SOURCE_OPERATOR) -> dict:
+    """One recorded step in the layout above. Used by the live recorder and by policy rollouts, so every
+    episode file has the same fields whoever drove the arms.
+
+    q_target: (14,) joint targets [left 7, right 7]; grippers: (2,) in [0 closed, 1 open];
+    ee_targets: the two TCP targets, each [x y z qw qx qy qz].
+    """
+    return {
+        "time": env.data.time,
+        "wall_time": time.monotonic(),
+        "obs": obs,
+        "action": {
+            "joint_pos": np.concatenate([q_target[:7], grippers[:1], q_target[7:], grippers[1:]]),
+            "ee_pose": np.concatenate([ee_targets[0], ee_targets[1], grippers]),
+        },
+        "sim": {"state": state},
+        "success": success,
+        "progress": progress,
+        "clutch": env.data.eq_active[env.clutch_eqs].copy(),
+        "contacts": np.asarray(contacts, bool),
+        "control": {"source": source},
+        "teleop": teleop,
+    }
 
 
 # -- episode files ---------------------------------------------------------------------------------
@@ -137,8 +188,39 @@ def list_episodes(out_dir: Path) -> list[dict]:
             "path": str(p), "file": p.name, "success": bool(m.get("success")),
             "duration_s": m.get("duration_s"), "num_steps": m.get("num_steps"),
             "input_mode": m.get("input_mode"), "operator": m.get("operator"), "created_at": m.get("created_at"),
+            "source": m.get("source", "teleop"),
         })
     return rows
+
+
+def episode_meta(cfg, env, num_steps: int, success: bool, input_mode: str, operator: str,
+                 source: str = "teleop") -> dict:
+    """File attributes of an episode (see the module docstring)."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "task": TASK,
+        "instruction": INSTRUCTION,
+        "operator": operator,
+        "input_mode": input_mode,
+        "source": source,
+        "success": bool(success),
+        "fps": cfg.sim.control_hz,
+        "seed": env.seed if env.seed is not None else -1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "duration_s": num_steps / cfg.sim.control_hz,
+        "num_steps": num_steps,
+        "model_xml": env.xml,
+        "scene_hash": env.scene_hash,
+        "config_yaml": yaml.safe_dump(cfg.model_dump()),
+        "camera_names": list(cfg.record.cameras),
+        "objects": list(OBJECTS),
+        "tower": {"pitch": PITCH, "brick_height": BRICK_H,
+                  "bricks": [{"name": b.name, "studs": [b.nx, b.ny], "height": b.nz, "rgba": list(b.rgba),
+                              "mass": b.mass} for b in BRICKS],
+                  "levels": [{"dx": dx, "dy": dy, "yaw": dyaw} for dx, dy, dyaw in TOWER],
+                  "clutch_pairs": [list(pair) for pair in CLUTCH_PAIRS],
+                  "clutch_press_n": CLUTCH_PRESS_N, "clutch_pull_n": CLUTCH_PULL_N},
+    }
 
 
 # -- recorder state machine ------------------------------------------------------------------------
@@ -194,36 +276,15 @@ class Recorder:
         self._clear()
         return True
 
-    def save(self, env, teleop_mode: str, success: bool | None = None) -> str | None:
+    def save(self, env, teleop_mode: str, success: bool | None = None, source: str = "teleop") -> str | None:
         """Write the take in the background. success=None uses whether the task check ever passed."""
         if self.state == RecState.RECORDING:
             self.stop()
         if self.state != RecState.REVIEW or not self.steps:
             return None
         path = next_episode_path(self.out_dir)
-        meta = {
-            "schema_version": SCHEMA_VERSION,
-            "task": TASK,
-            "instruction": INSTRUCTION,
-            "operator": self.cfg.record.operator,
-            "input_mode": teleop_mode,
-            "success": self.success_seen if success is None else bool(success),
-            "fps": self.cfg.sim.control_hz,
-            "seed": env.seed if env.seed is not None else -1,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "duration_s": len(self.steps) / self.cfg.sim.control_hz,
-            "num_steps": len(self.steps),
-            "model_xml": env.xml,
-            "config_yaml": yaml.safe_dump(self.cfg.model_dump()),
-            "camera_names": list(self.cfg.record.cameras),
-            "objects": list(OBJECTS),
-            "tower": {"pitch": PITCH, "brick_height": BRICK_H,
-                      "bricks": [{"name": b.name, "studs": [b.nx, b.ny], "height": b.nz, "rgba": list(b.rgba),
-                                  "mass": b.mass} for b in BRICKS],
-                      "levels": [{"dx": dx, "dy": dy, "yaw": dyaw} for dx, dy, dyaw in TOWER],
-                      "clutch_pairs": [list(pair) for pair in CLUTCH_PAIRS],
-                      "clutch_press_n": CLUTCH_PRESS_N, "clutch_pull_n": CLUTCH_PULL_N},
-        }
+        meta = episode_meta(self.cfg, env, len(self.steps), self.success_seen if success is None else bool(success),
+                            input_mode=teleop_mode, operator=self.cfg.record.operator, source=source)
         self._pending = self._writer.submit(write_episode, path, self.steps, meta)
         self.saved_count += 1
         self._clear()

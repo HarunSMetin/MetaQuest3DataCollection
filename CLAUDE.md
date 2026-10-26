@@ -3,7 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 QuestCollect: teleoperate two simulated Franka Panda arms (MuJoCo) from a Meta Quest 3 via a WebXR page, record
-demonstrations of one task (`build_tower`: stack 4 DUPLO bricks into a fixed tower) to HDF5, export to LeRobot.
+demonstrations of one task (`build_tower`: stack 4 DUPLO bricks into a fixed tower) to HDF5, then audit → export to
+LeRobot → train (ACT via lerobot-train) → evaluate in sim → run the policy live with shared control (DAgger).
 Python 3.12 backend in a flat package (`questcollect/`, one module per pipeline stage), TypeScript/three.js/React
 frontend (`web/`). Two human docs, keep both in sync with behaviour changes: `README.md` (users: install, controls,
 data format, config table, troubleshooting) and `docs/architecture.md` (developers: tick order, threads, endpoints,
@@ -13,17 +14,21 @@ protocol, frames, "Common changes" table of files that change together).
 
 ```bash
 ./scripts/fetch_assets.sh               # Franka model from mujoco_menagerie -> assets/third_party/ (gitignored)
-uv sync                                 # add --extra export for lerobot
+uv sync                                 # add --extra learn for lerobot/torch (questcollect/learn/)
 (cd web && npm ci && npm run build)     # server serves web/dist; rebuild after web changes
 uv run qc doctor                        # environment checklist
 
 uv run qc serve [--mode hands] [--config my.yaml] [--no-https]
 uv run qc view | replay <ep.hdf5> | inspect <ep.hdf5>
-uv run qc export [--action ee] [--include-failures] [--out data/lerobot]
+uv run qc audit [--exclude ep.hdf5 --note why]       # quality report; cache data/episodes/audit.json
+uv run qc export <name> [--randomize-visuals]          # -> data/lerobot/<name> (+ questcollect_manifest.json)
+uv run qc train <dataset> [--preset act_240] [--dry-run] [--key=value ...]   # -> outputs/<run>/train
+uv run qc eval outputs/<run> [--n 50] [--ensemble 0.01]   # -> outputs/<run>/eval/<time>/metrics.json
+uv run qc serve --policy outputs/<run> [--control shared|policy]
 
 uv run --group dev pytest                                   # all tests
 uv run --group dev pytest tests/test_teleop.py::test_protocol_roundtrip   # single test
-MUJOCO_GL=egl uv run --group dev pytest                     # also runs the LeRobot export test (needs --extra export)
+MUJOCO_GL=egl uv run --extra learn --group dev pytest       # also tests/test_learn.py (export -> train -> eval)
 
 cd web && npm run typecheck             # tsc --noEmit (also part of npm run build)
 cd web && npm run dev                   # vite on :5173, proxies /api and /ws to :8000
@@ -100,9 +105,24 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   after success) plus HDF5 read/write; the file layout is documented in its module docstring. Images are never
   recorded: full `sim/state` per step lets the exporter re-render cameras at any resolution. `action/joint_pos` uses
   the ALOHA/ACT layout `[7 left, left grip, 7 right, right grip]`, grip 0 = closed, 1 = open.
-- **Export**: keep all LeRobot API usage in `lerobot_export.py` (lerobot is an optional extra).
-  `--randomize-visuals` applies `AppearanceRandomizer` (lights, colours, camera mounts) per episode at render time.
-- **Config**: runtime tunables live in `config.yaml`, loaded into pydantic models in `config.py`. Exceptions: the task
+- **One definition per concept**: contacts = `BimanualEnv.contact_flags` (warnings, recording, audit, eval); a
+  recorded step = `recorder.make_step`, file attrs = `recorder.episode_meta` (live recorder and eval rollouts);
+  policy obs/action layout = `learn/features.FeatureSpec` (export and `PolicyRunner`; stored in each dataset
+  manifest); episode selection = `audit.verdict`/`select` (`curate` config + `curation.json`). Schema v5 adds
+  `contacts` and `control/source`; `audit.py` replays `sim/state` for older files.
+- **Replaying recorded episodes**: use `sim.env_from_episode(meta)` (episode's own config + `scene_hash` check), not
+  `BimanualEnv(load_config())`. `scene_hash` is computed from the saved MJCF via `load_recorded_model` (the compiled
+  spec hashes differently by float noise). Re-renders match to within 1/255 (GPU shadow noise, also between runs).
+- **Learning** (`questcollect/learn/`, extra `learn`): nothing outside it imports torch/lerobot; the runtime imports
+  `learn.policy` only in `Runtime.load_policy`. All LeRobot dataset API in `learn/export.py`; training is a
+  `lerobot-train` subprocess (`learn/train.py`, run layout `outputs/<run>/{questcollect_run.json,train,eval}`);
+  `PolicyRunner` needs that run manifest to know the FeatureSpec. Eval seeds come from `EVAL_SEED_BASE`.
+- **Control modes** (`Runtime._who_drives`): teleop | policy | shared. Policy path = `PolicyRunner.act` →
+  `SafetyFilter.filter` (mink QP, 8 substeps: the linearized collision limits need them) → apply. While the policy
+  drives, `ik.reset(q)` + `Teleop.sync_hold` keep the operator side at the current pose so a Grip takeover never
+  jumps. `record.action_noise` = DART noise on executed (not recorded) operator targets.
+- **Config**: runtime tunables live in `config.yaml` (incl. `curate`, `learn` + presets, `safety`, `control`),
+  loaded into pydantic models in `config.py`. Exceptions: the task
   definition (brick sizes/colors/masses, `TOWER`, tolerances, stud `PLAY`, clutch forces) is constants at the top of
   `sim.py`, and
   the haptic patterns are `HAPTIC_*` constants in `runtime.py`.

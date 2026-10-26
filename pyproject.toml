@@ -21,7 +21,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-export = ["lerobot"]
+# Policy learning (questcollect/learn/): LeRobot export, training, evaluation, live policy. Brings torch.
+learn = ["lerobot"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

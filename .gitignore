@@ -32,3 +32,6 @@ howToRun.md
 .vscode/
 .idea/
 .DS_Store
+
+# Training runs (qc train / qc eval)
+outputs/

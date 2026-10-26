@@ -30,11 +30,52 @@ ik:
 record:
   out_dir: data/episodes
   countdown_s: 3
-  cameras: [cam_high, cam_low, cam_left_wrist, cam_right_wrist]
+  cameras: [cam_high, cam_low, cam_left_wrist, cam_right_wrist]   # dashboard previews
   operator: operator
+  action_noise: 0.0          # DART: rad of noise on the executed (not the recorded) joint targets; try 0.01
 
 server:
   host: 0.0.0.0
   port: 8000
   https_port: 8443
   cert_dir: certs
+
+# --- policy learning (qc audit / export / train / eval; needs `uv sync --extra learn`) ---------------
+
+curate:                      # which recorded steps go into a training dataset (see `qc audit`)
+  include_failures: false
+  max_link_table_frac: 0.01  # arm links resting on the table
+  max_arm_arm_frac: 0.0      # the two arms touching
+  max_tip_table_frac: 0.3    # hand/fingertips on the table (some is normal: bricks are 19 mm tall)
+  trim_idle: true            # drop the still start and end of each episode
+  dagger_frames: operator    # shared-control episodes: only the operator's corrections, or `all`
+
+learn:                       # what the policy sees and outputs (fixed per dataset, stored in its manifest)
+  cameras: [cam_high, cam_left_wrist, cam_right_wrist]
+  image_size: [240, 320]     # height, width; 480x640 does not fit a 6 GB GPU with ACT
+  action: joint              # joint | ee
+  env_state: false           # brick poses as an input (privileged: simulation only)
+  datasets_dir: data/lerobot
+  runs_dir: outputs
+  presets:                   # `qc train <dataset> --preset <name>`: lerobot-train arguments
+    act_240:                 # RTX 4050 6 GB: ~3.6 GB, ~54 samples/s, ~8 h
+      policy.type: act
+      policy.device: cuda
+      policy.use_amp: true
+      policy.chunk_size: 100
+      policy.n_action_steps: 100
+      policy.push_to_hub: false
+      batch_size: 16
+      num_workers: 8
+      steps: 100000
+      save_freq: 20000
+
+safety:                      # filter on policy actions (qc eval, qc serve --policy)
+  enabled: true
+  arm_margin: 0.02           # m between the two arms
+  table_margin: 0.01         # m between arm links and the table top
+
+control:                     # who drives in `qc serve`: teleop | policy | shared (policy until you take over)
+  mode: teleop
+  policy: null               # outputs/<run>, or pass --policy
+  n_action_steps: 10         # live: steps executed per predicted chunk before asking the policy again

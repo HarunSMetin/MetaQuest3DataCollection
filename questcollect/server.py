@@ -13,6 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from questcollect.audit import audit_dir, load_curation, set_curation, verdict
 from questcollect.config import ROOT
 from questcollect.protocol import parse_input
 from questcollect.runtime import Runtime
@@ -81,6 +82,26 @@ def create_app(runtime: Runtime) -> FastAPI:
             raise HTTPException(400, "invalid episode path")
         p.unlink()
         return {"deleted": str(p)}
+
+    @app.get("/api/audit")
+    async def audit():
+        """Per episode: contact shares, idle share, and why a training dataset would leave it out (or null)."""
+        def run():
+            folder = runtime.cfg.out_dir
+            audits = audit_dir(folder)
+            curation = load_curation(folder)
+            return {name: {"contact_frac": a.contact_frac, "idle_frac": a.idle_frac,
+                           "excluded": bool(curation.get(name, {}).get("exclude")),
+                           "verdict": verdict(a, runtime.cfg.curate, curation)} for name, a in audits.items()}
+        return await asyncio.to_thread(run)
+
+    @app.post("/api/curation")
+    async def curation(body: dict):
+        file = Path(str(body.get("file", ""))).name
+        if not (runtime.cfg.out_dir / file).exists():
+            raise HTTPException(400, "unknown episode")
+        set_curation(runtime.cfg.out_dir, file, bool(body.get("exclude")), str(body.get("note", ""))[:200])
+        return {"ok": True}
 
     @app.post("/api/command")
     async def command(body: dict):

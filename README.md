@@ -24,8 +24,9 @@ QuestCollect produces those examples in simulation:
 2. You put on a **Meta Quest 3** and open a web page. You see the table and the arms in VR (or mixed reality) and
    move them with the **Touch controllers** or your **bare hands**.
 3. Every attempt is saved as one **episode** file, with the complete simulator state at every step.
-4. One command turns the episodes into a **[LeRobot](https://github.com/huggingface/lerobot) dataset** that
-   training code for ACT, Diffusion Policy, π0 or SmolVLA reads directly.
+4. A quality check picks the clean demonstrations, one command turns them into a
+   **[LeRobot](https://github.com/huggingface/lerobot) dataset**, and another trains a policy (ACT) on it.
+5. The trained policy is tested in the simulator, and you can watch it in the headset and take over to correct it.
 
 Nothing is installed on the headset: the PC serves a web page and the Quest Browser opens it.
 
@@ -50,7 +51,7 @@ Nothing is installed on the headset: the PC serves a web page and the Quest Brow
   [2. Connect the Quest](#2-connect-the-quest-3) ·
   [3. Controls](#3-controls) ·
   [4. Record](#4-record-demonstrations) ·
-  [5. Export](#5-export-for-training)
+  [5. Train a policy](#5-train-and-evaluate-a-policy)
 - [What gets recorded](#what-gets-recorded)
 - [How it works](#how-it-works)
 - [Repository layout](#repository-layout)
@@ -134,6 +135,7 @@ own bricks and set them at the top of [questcollect/sim.py](questcollect/sim.py)
 | **Meta Quest 3** | teleoperation. Optional for a first look. |
 | **adb** (`sudo apt install android-tools-adb`) | the USB connection to the headset. |
 | **openssl** (usually preinstalled) | the Wi-Fi connection only. |
+| **NVIDIA GPU** with ≥ 6 GB (CUDA) | training policies (`qc train`). Recording, export and evaluation also run without one, more slowly. |
 
 <details>
 <summary>Installing uv and Node.js</summary>
@@ -173,13 +175,16 @@ Everything goes through the `qc` command (run it as `uv run qc …`; every comma
 | `qc view` | open the scene in MuJoCo's own viewer (no headset) |
 | `qc inspect <file>` | show what is inside an episode file |
 | `qc replay <file>` | play an episode back in MuJoCo's viewer |
-| `qc export` | turn the episodes into a LeRobot dataset |
+| `qc audit` | quality report of every episode, and which ones training will use |
+| `qc export <name>` | turn the selected episodes into a LeRobot dataset |
+| `qc train <dataset>` | train a policy on a dataset (lerobot-train) |
+| `qc eval <run>` | test a trained policy in the simulator |
 | `qc doctor` | check the installation |
 
 ### 1. Start the server
 
 ```bash
-uv run qc serve                     # options: --mode hands · --config my.yaml · --no-https
+uv run qc serve                     # options: --mode hands · --config my.yaml · --no-https · --policy outputs/<run>
 ```
 
 Keep this terminal open and open **<http://localhost:8000/dashboard/>** on the PC. You should see both arms, the
@@ -298,22 +303,100 @@ uv run qc replay  data/episodes/episode_000000.hdf5   # play it back in MuJoCo's
 The dashboard's **Dataset** card lists all episodes: ▶ replays one in the scene (also shown in the headset), 🗑
 deletes it.
 
-### 5. Export for training
+### 5. Train and evaluate a policy
+
+From recorded demonstrations to a policy that builds the tower by itself, in five commands. Everything here
+needs the learning extra (LeRobot and PyTorch, a few GB):
 
 ```bash
-uv sync --extra export     # once: installs LeRobot
-uv run qc export           # data/episodes -> data/lerobot
+uv sync --extra learn
 ```
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--action joint\|ee` | `joint` | state and action as joint angles, or as gripper poses |
-| `--height`, `--width` | 480, 640 | camera image size (images are rendered during export, at any size) |
-| `--include-failures` | off | also export takes saved as failures |
-| `--randomize-visuals` | off | vary lighting, colours and camera mounts per episode (helps vision policies transfer to real cameras) |
-| `--out` | `data/lerobot` | output folder |
-| `--raw` | `record.out_dir` | episode folder to read |
-| `--repo-id` | `local/quest_bimanual_panda` | dataset name |
+```mermaid
+flowchart LR
+    E[("data/episodes/<br/>your demos")] --> A["qc audit<br/>quality report"]
+    A --> X["qc export v1<br/>LeRobot dataset"]
+    X --> T["qc train v1<br/>ACT, ~8 h"]
+    T --> V["qc eval<br/>success rate"]
+    T --> S["qc serve --policy<br/>watch it, correct it"]
+    S -- "your corrections<br/>(DAgger)" --> E
+```
+
+**1. Check the data.** `qc audit` replays every episode and reports how often an arm touched the table or the
+other arm, how much of it is idle, and when each tower level clicked in. It shows which episodes a dataset will
+use and why the others are left out:
+
+```bash
+uv run qc audit                                              # report (cached after the first run)
+uv run qc audit --exclude episode_000012.hdf5 --note "clumsy"  # leave one out by hand (--include to undo)
+```
+
+```text
+episode_000001.hdf5     118.5s   2.3%  0.0%   2.0%   7%   39.5  68.2 103.7   ✗ arm link on the table 2.3% of the time (limit 1.0%)
+episode_000006.hdf5      44.9s   0.0%  0.0%  45.0%   4%   19.2  21.3  43.8   ✗ hand dragging on the table 45.0% of the time (limit 30.0%)
+episode_000086.hdf5      51.5s   0.0%  0.0%   1.5%   7%   18.9  38.0  49.4   ✓ 51 s used
+
+78 of 87 episodes used: 83.8 of 94.8 min (78 segments).
+```
+
+The rules (contact limits, trimming the still start and end of each take, failed takes) are the `curate`
+section of [config.yaml](config.yaml). The dashboard's Dataset card shows the same verdict per episode (⚠ / ✓)
+and can exclude an episode (⊘). Your episode files are never changed.
+
+**2. Export a dataset.** Renders the cameras from the recorded states, in the scene each episode was recorded in:
+
+```bash
+uv run qc export v1                       # -> data/lerobot/v1  (~35 s per minute of demonstrations)
+uv run qc export v1b --randomize-visuals  # vary lights, colours and camera mounts (more robust to looks)
+```
+
+What the policy sees and outputs is the `learn` section of the config: by default `cam_high` and both wrist
+cameras at 240×320, plus joint angles and gripper openings, and joint targets as actions (the ACT recipe). Each
+dataset stores these settings in its `questcollect_manifest.json`, together with exactly which episodes and
+steps went in.
+
+**3. Train.** Runs [`lerobot-train`](https://github.com/huggingface/lerobot) with a named preset from the config:
+
+```bash
+uv run qc train v1                        # preset act_240 -> outputs/<date>_act_240_v1/
+uv run qc train v1 --dry-run              # only print the lerobot-train command
+uv run qc train v1 --steps=200000         # any extra --key=value goes to lerobot-train
+```
+
+The `act_240` preset is [ACT](https://tonyzhaozh.github.io/aloha/) (action chunks of 100 steps = 2 s) sized for a
+6 GB laptop GPU (RTX 4050): batch 16, mixed precision, ~3.6 GB of GPU memory, ~8 hours for 100k steps.
+
+**4. Evaluate.** Runs the policy in the simulator on 50 fixed scenes it never saw, as fast as the PC allows:
+
+```bash
+uv run qc eval outputs/<run>                  # last checkpoint, 50 rollouts
+uv run qc eval outputs/<run> --ensemble 0.01  # ACT temporal ensembling (smoother, slower)
+```
+
+It prints the success rate and how far the tower got (base in the square, levels 1–3), the contacts, and how
+much the safety filter had to correct. Every rollout is saved as a normal episode file (`qc replay` it to watch a
+failure); the numbers go to `outputs/<run>/eval/<time>/metrics.json`.
+
+**5. Watch it, and correct it (DAgger).** Let the policy drive in the headset:
+
+```bash
+uv run qc serve --policy outputs/<run>            # shared control: the policy drives, you can take over
+uv run qc serve --policy outputs/<run> --control policy   # policy only
+```
+
+In shared mode, press **Grip** whenever the policy is about to go wrong. You take over that arm from exactly where
+it is; release it and the policy carries on. Record while you do this: the steps you drove are marked in the
+episode, and the next `qc export` uses only your corrections from these takes (`curate.dagger_frames`). That is
+the most effective data you can add: it shows the policy how to recover from its own mistakes. The dashboard's
+Teleoperation card switches between *You drive*, *Shared* and *Policy*.
+
+**Collisions.** Three layers keep the arms off the table and away from each other:
+
+| Layer | What it does |
+| --- | --- |
+| Clean data | `qc audit` leaves out takes where an arm rested on the table, the arms touched, or the hand dragged along the table. |
+| Recovery data | DAgger corrections (above), and optionally `record.action_noise` (DART): small noise on what is executed while you record, so the data shows how you recover. |
+| Safety filter | Every policy action passes [questcollect/safety.py](questcollect/safety.py): it changes the joint targets as little as possible so the arms stay ≥ 2 cm apart and 1 cm above the table (fingertips may touch it). |
 
 ## What gets recorded
 
@@ -332,9 +415,11 @@ docstring at the top of [questcollect/recorder.py](questcollect/recorder.py).
 | `success` | (T,) | whether the tower is finished and standing |
 | `progress` | (T,) | bricks correctly clicked onto the base so far (0–3); useful as sub-task labels |
 | `clutch` | (T, 6) | which of the 6 brick pairs are clicked together |
+| `contacts` | (T, 3) | an arm link on the table, the two arms touching, a hand or fingertip on the table |
+| `control/source` | (T,) | who drove this step: 0 you, 1 a policy (shared-control takes) |
 | `teleop/*` | | head pose; per hand the raw controller pose and buttons or 25 hand-joint poses, pinch distances; engaged / tracked flags; latency |
 | `time`, `wall_time` | (T,) | simulation time and PC clock |
-| *file attributes* | | task, instruction, operator, input mode, success, random seed, date, duration, the full scene (MJCF), the config, camera names, and the tower definition |
+| *file attributes* | | task, instruction, operator, input mode, source (teleop / policy / shared), success, random seed, date, duration, the full scene (MJCF) and its fingerprint, the config, camera names, and the tower definition |
 
 <details>
 <summary>Example: <code>qc inspect</code> on a 51-second episode</summary>
@@ -348,7 +433,7 @@ docstring at the top of [questcollect/recorder.py](questcollect/recorder.py).
                   green 1x2x2 on top. Press each brick down until it clicks.
        num_steps: 2577
          objects: ['red_2x4', 'blue_2x3', 'yellow_2x2', 'green_1x2x2']
-  schema_version: 4
+  schema_version: 4   (files recorded now are version 5: + contacts, control/source)
          success: True
             task: build_tower
              ...
@@ -369,7 +454,8 @@ teleop/left/joints               (2577, 25, 7)      float64
 </details>
 
 **Camera images are not stored while recording.** Because the complete simulator state is saved, the exporter
-replays every step exactly and renders the cameras afterwards, at whatever resolution you choose. Recording stays
+replays every step exactly and renders the cameras afterwards, at whatever resolution you choose, in the scene
+the episode was recorded in (each file stores its config and a fingerprint of the scene). Recording stays
 light, and you can re-export with other image sizes without recording again. The four cameras use the ALOHA
 names, so existing ACT configs work as they are:
 
@@ -379,10 +465,10 @@ names, so existing ACT configs work as they are:
 
 | Feature | Shape | Contents |
 | --- | --- | --- |
-| `observation.state` | (16,) | joint angles + gripper openings (or gripper poses with `--action ee`) |
+| `observation.state` | (16,) | joint angles + gripper openings (or gripper poses with `learn.action: ee`) |
 | `action` | (16,) | `action/joint_pos` (or `action/ee_pose`) |
-| `observation.images.<camera>` | (H, W, 3) | one video per camera, re-rendered from `sim/state` |
-| `observation.environment_state` | (28,) | the four brick poses (simulation only; a real robot doesn't have these) |
+| `observation.images.<camera>` | (H, W, 3) | one video per camera in `learn.cameras`, re-rendered from `sim/state` |
+| `observation.environment_state` | (28,) | the four brick poses, only with `learn.env_state: true` (simulation only; a real robot doesn't have these) |
 | `task` | text | the instruction, used as the language prompt |
 
 ## How it works
@@ -424,18 +510,27 @@ physics, and which files change together) is in **[docs/architecture.md](docs/ar
 
 ```text
 questcollect/              the Python package, one module per stage of the pipeline
-  cli.py                   the `qc` command (serve, setup-quest, certs, view, inspect, replay, export, doctor)
+  cli.py                   the `qc` command (serve, setup-quest, certs, view, inspect, replay, audit, export,
+                           train, eval, doctor)
   config.py                loads config.yaml into typed settings
   sim.py                   the MuJoCo scene, the bricks, the tower task (progress, success), the environment
   frames.py                converts poses between the headset's coordinates and the simulator's
   teleop.py                hand / controller motion → gripper targets (clutch, smoothing, safety checks)
   ik.py                    gripper targets → joint angles for both arms (inverse kinematics with mink)
-  runtime.py               the 50 Hz loop: input → teleop → IK → physics → record, plus vibration and sound events
+  runtime.py               the 50 Hz loop: input → teleop → IK (or policy → safety filter) → physics → record,
+                           plus vibration and sound events
   recorder.py              record / save / discard logic and the HDF5 episode format
   server.py                web server: the pages, the REST API, websockets to the headset and the dashboard
   protocol.py              binary message format between headset and server (mirrored in web/src/protocol.ts)
   scene_export.py          sends the scene's shapes and meshes to the browser so it can draw them
-  lerobot_export.py        episode files → LeRobot dataset (re-renders the cameras)
+  audit.py                 episode quality report (contacts, idle time) and which steps training uses
+  safety.py                safety filter on policy actions: arms apart, off the table
+  learn/                   policy learning; the only code that uses PyTorch / LeRobot (`uv sync --extra learn`)
+    features.py            what a policy sees and outputs (shared by export and the policy runner)
+    export.py              selected episodes → LeRobot dataset (re-renders the cameras) + manifest
+    train.py               presets → lerobot-train runs in outputs/<run>/
+    policy.py              runs a trained policy on the simulated arms
+    evaluate.py            `qc eval`: rollouts on held-out scenes, success and stage metrics
 web/                       the browser side (TypeScript, three.js, React), built into web/dist/
   xr/index.html            the headset page    → code in src/xr/        (WebXR app, panels, controllers, sounds)
   dashboard/index.html     the PC dashboard    → code in src/dashboard/ (React)
@@ -444,18 +539,20 @@ web/                       the browser side (TypeScript, three.js, React), built
   src/protocol.ts, net.ts  message formats and the websocket connection
   public/xr-profiles/      Quest 3 Touch Plus controller models (vendored, MIT)
   e2e/                     tests with an emulated Quest 3, and the README screenshots
-tests/                     Python tests: teleop and protocol; physics, clicking, gripper, IK, recording, export
+tests/                     Python tests: teleop, protocol; physics, clicking, gripper, IK, recording; audit,
+                           safety filter, shared control; export → train → eval (test_learn.py)
 scripts/
   fetch_assets.sh          downloads the Franka model from MuJoCo Menagerie into assets/third_party/
   make_media.py            renders docs/media/demo.gif, tower.png, cameras.png
 docs/
   architecture.md          how the code works, for developers
   media/                   the images and the GIF in this README
-config.yaml                all runtime settings
+config.yaml                all settings
 ```
 
 Created when you run things (all gitignored): `.venv/`, `assets/third_party/` (robot model), `web/node_modules/`,
-`web/dist/`, `certs/` (Wi-Fi certificate), `data/episodes/` (your recordings), `data/lerobot/` (exports).
+`web/dist/`, `certs/` (Wi-Fi certificate), `data/episodes/` (your recordings, plus `audit.json` and
+`curation.json` next to them), `data/lerobot/<name>/` (datasets), `outputs/<run>/` (training runs and evaluations).
 
 ## Configuration
 
@@ -479,9 +576,16 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | `ik.iterations` | 2 | IK solver iterations per control step |
 | `record.out_dir` | `data/episodes` | where episodes are saved |
 | `record.countdown_s` | 3 | countdown before recording starts (s) |
-| `record.cameras` | the four cameras | cameras shown on the dashboard and exported |
+| `record.cameras` | the four cameras | camera previews on the dashboard |
 | `record.operator` | `operator` | default operator name stored in episodes |
+| `record.action_noise` | 0 | DART: rad of noise on the executed joint targets while recording (the clean target is recorded) |
 | `server.host`, `port`, `https_port`, `cert_dir` | 0.0.0.0, 8000, 8443, `certs` | network address, ports and certificate folder |
+| `curate.*` | | which episodes and steps training uses: contact limits, `trim_idle`, `include_failures`, `dagger_frames` |
+| `learn.cameras`, `image_size`, `action`, `env_state` | 3 cameras, 240×320, joint, false | what a policy sees and outputs |
+| `learn.datasets_dir`, `runs_dir` | `data/lerobot`, `outputs` | where datasets and training runs go |
+| `learn.presets` | `act_240` | named lerobot-train settings for `qc train --preset` |
+| `safety.enabled`, `arm_margin`, `table_margin` | true, 0.02, 0.01 | the safety filter on policy actions (m) |
+| `control.mode`, `policy`, `n_action_steps` | teleop, none, 10 | who drives in `qc serve`, and how often a live policy is asked |
 
 **The task** is defined by constants at the top of [questcollect/sim.py](questcollect/sim.py): the bricks
 (`BRICKS`: size, colour, mass), the tower layout (`TOWER`), the taped square (`BUILD_AREA_CENTER`,
@@ -507,13 +611,15 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | Bricks are hard to seat | Raise `PLAY` (stud clearance) in `questcollect/sim.py`. |
 | A brick slips in the gripper | Raise `sim.gripper_force` in `config.yaml`. |
 | Laggy over Wi-Fi | Use the USB cable, or move closer to a 5/6 GHz access point. |
+| `qc export` says the dataset already exists | Datasets are never overwritten: pick a new name, or delete `data/lerobot/<name>`. |
+| `qc eval` / `serve --policy`: *not inside a qc train run* | Point it at the run folder `outputs/<run>` made by `qc train` (it holds the dataset settings the policy needs). |
 | `EGLError` printed when a command exits | Harmless: MuJoCo's GL context is cleaned up after Python has shut down. |
 
 ## Development
 
 ```bash
-uv run --group dev pytest                    # Python tests (~10 s)
-MUJOCO_GL=egl uv run --group dev pytest      # + the LeRobot export test (needs `uv sync --extra export`)
+uv run --group dev pytest                               # Python tests (~10 s)
+MUJOCO_GL=egl uv run --extra learn --group dev pytest   # + export -> train -> eval end to end (~20 s)
 cd web && npm run typecheck                  # TypeScript
 cd web && npm run dev                        # pages with hot reload on :5173 (proxies to a running `qc serve`)
 ```

@@ -83,7 +83,8 @@ export class Hud {
       text(g, val, sx + 230, y, 30, { color: c, weight: 800, align: "right" });
     };
     stat("EPISODES", `${s.saved_count}`, py + 22);
-    stat("MODE", s.mode === "controllers" ? "CTRL" : "HANDS", py + 66, THEME.accent);
+    if (s.control?.policy) stat("DRIVER", s.control.driver === "policy" ? "POLICY" : "YOU", py + 66, s.control.driver === "policy" ? THEME.warn : THEME.accent);
+    else stat("MODE", s.mode === "controllers" ? "CTRL" : "HANDS", py + 66, THEME.accent);
     const rtt = s.rtt_ms;
     stat("LATENCY", rtt != null ? `${Math.round(rtt)} ms` : "—", py + 110, rtt != null && rtt > 60 ? THEME.warn : THEME.ok);
     stat("INPUT", `${Math.round(s.input_hz)} Hz`, py + 154);

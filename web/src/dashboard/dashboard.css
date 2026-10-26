@@ -99,6 +99,7 @@ input:focus { outline: none; border-color: var(--accent); }
 .btn.bad { color: var(--bad); border-color: rgba(255,77,109,0.4); }
 .btn.ghost { background: transparent; }
 .btn.small { padding: 5px 10px; font-size: 12px; }
+.control-note { font-size: 12px; margin-top: 8px; }
 .btn.wide { width: 100%; margin-top: 10px; }
 .btn kbd { margin-left: 4px; }
 .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
@@ -130,7 +131,7 @@ input[type=range] { accent-color: var(--accent); width: 100%; }
 .warn-chip { font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--stroke); color: var(--dim); opacity: 0.5; }
 .warn-chip.on { opacity: 1; color: var(--bad); border-color: var(--bad); background: rgba(255,77,109,0.1); }
 
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
 .stats div { padding: 10px; border-radius: 12px; background: rgba(0,0,0,0.22); border: 1px solid var(--stroke); display: grid; }
 .stats b { font-size: 20px; }
 .stats span { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }

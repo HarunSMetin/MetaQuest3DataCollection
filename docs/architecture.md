@@ -12,6 +12,7 @@ things. For installing and using QuestCollect, see the [README](../README.md).
 - [Inverse kinematics](#inverse-kinematics)
 - [The scene and the task](#the-scene-and-the-task)
 - [Recording, replay and export](#recording-replay-and-export)
+- [Policy learning](#policy-learning)
 - [The web client](#the-web-client)
 - [Common changes](#common-changes)
 - [Tests](#tests)
@@ -54,14 +55,14 @@ about the robot or the bricks is hard-coded in the browser.
 | --- | --- | --- |
 | 1 | `Runtime._process_commands` | Apply queued commands (record, save, reset, set mode, …) from the dashboard, the headset menu or the buttons. |
 | 2 | `Teleop.update` | Latest input frame → one end-effector target and one gripper value per arm (see [Teleoperation](#teleoperation-from-hand-to-arm-target)). |
-| 3 | `BimanualIK.follow` + `solve` | Targets → 14 joint angles, with the IK held within `ik.max_lead` of the measured joints. |
+| 3 | `BimanualIK.follow` + `solve` | Targets → 14 joint angles, with the IK held within `ik.max_lead` of the measured joints. When a policy drives instead (see [Control modes](#policy-learning)): `PolicyRunner.act` → `SafetyFilter.filter`. |
 | 4 | `Recorder.tick` | Advance the countdown; switch to recording when it ends. |
 | 5 | `BimanualEnv.observe` / `get_state` | If recording: snapshot the observation and the full sim state *before* the step. |
-| 6 | `BimanualEnv.apply_action` | Joint targets to the arm servos; the gripper target moves at 50 mm/s per finger. |
-| 7 | `Recorder.append` | If recording: store the step (obs, action, state, success, progress, clutch, raw teleop). |
+| 6 | `BimanualEnv.apply_action` | Joint targets (plus DART noise if `record.action_noise`) to the arm servos; the gripper target moves at 50 mm/s per finger. |
+| 7 | `Recorder.append` | If recording: store the step built by `recorder.make_step` (obs, action, state, success, progress, clutch, contacts, who drove, raw teleop). |
 | 8 | `BimanualEnv.step` | 10 physics substeps (`physics_dt` = 2 ms), then `_update_clutch` clicks or unclicks bricks. |
 | 9 | `Runtime._task_feedback` | Compare grasp / progress / clutch state with the last tick and emit haptic, sound and toast events. |
-| 10 | `Runtime._check_warnings` | Arm–arm and arm–table contacts, out-of-reach targets. |
+| 10 | `Runtime._check_warnings` | Arm–arm and arm–table contacts (`BimanualEnv.contact_flags`, the one contact definition also used by recording, audit and evaluation), out-of-reach targets. |
 | 11 | `Runtime._publish` | Pack the pose frame; every 5th tick the status dict; every 6th tick camera previews (only while someone is looking). |
 
 During a replay (`replay` command or `qc replay`), steps 2–10 are skipped: the tick just loads the next recorded
@@ -87,6 +88,7 @@ Rule: the server never touches simulation state directly. Anything that changes 
 | `GET /api/task` | → browser | the goal as data: bricks, where each goes, the build area (`sim.task_spec()`) |
 | `GET /api/status` | → browser | the latest status dict (same as on the websockets) |
 | `GET /api/episodes`, `DELETE /api/episodes?path=` | ↔ | list / delete saved episodes |
+| `GET /api/audit`, `POST /api/curation` | ↔ | per-episode audit verdicts; exclude / include an episode for training |
 | `POST /api/command` | → server | `{"name": ..., "args": {...}}`, queued to the sim thread |
 | `GET /api/preview/<cam>.jpg` | → browser | latest camera preview (rendered only while requested) |
 | `WS /ws/xr` | both | headset: binary input frames in; binary pose frames (every tick), JSON status + events out |
@@ -183,14 +185,56 @@ than 3 cm away from what the IK can reach, the arm is flagged *out of reach*.
   `idle → countdown (3 s) → recording → review → saved | discarded → idle`. With auto-stop on, recording ends
   1 s after the task first succeeds. Saving resets the scene with a new random brick layout.
 - **File format.** One HDF5 file per episode; the full field list is the module docstring of `recorder.py`.
-  Images are never recorded.
+  Every step is built by `recorder.make_step` and every file's attributes by `recorder.episode_meta`, whoever
+  drove (the live recorder, `qc eval` rollouts), so all episodes look the same. Images are never recorded.
 - **Exact replay.** `sim/state` is MuJoCo's full integration state *plus* the six clutch welds' relative poses.
   The welds live in `model.eq_data`, which `mj_getState` doesn't cover, so always use
   `BimanualEnv.get_state` / `set_state`, never raw `mj_getState`.
-- **Export** ([questcollect/lerobot_export.py](../questcollect/lerobot_export.py)): for each episode, set every
-  recorded state, render the four cameras at the requested resolution, and add the frame to a `LeRobotDataset`.
-  With `--randomize-visuals`, `AppearanceRandomizer` varies lights, surface colours, brick brightness and camera
-  mounts per episode (rendering only). All LeRobot API calls live in this one file.
+- **Replaying in the right scene.** Each episode stores its config and `scene_hash` (a fingerprint of geoms,
+  masses, materials, cameras and state layout, computed from the saved MJCF). `sim.env_from_episode(meta)` builds
+  the scene from the episode's own config and warns if the fingerprint differs from today's scene.
+  `sim.load_recorded_model` compiles a saved `model_xml` (its meshes are found in the Menagerie folder).
+
+## Policy learning
+
+The learning side is a pipeline of stages; each one writes a folder with a manifest, and raw episodes are never
+modified:
+
+```text
+data/episodes/*.hdf5 ──qc audit──▶ audit.json (+ curation.json) ──qc export──▶ data/lerobot/<name>/
+      ▲                                                                              │
+      │                                                                         qc train
+      │                                                                              ▼
+      └──── qc serve --policy (shared control: your corrections) ◀──── outputs/<run>/train/checkpoints/…
+                                                                        └── qc eval ──▶ outputs/<run>/eval/<time>/
+```
+
+**The dependency rule:** nothing outside [questcollect/learn/](../questcollect/learn/) imports torch or lerobot
+(optional extra `learn`), so recording works without them. The runtime imports `learn.policy` only inside
+`Runtime.load_policy`.
+
+| Stage | Code | What it does |
+| --- | --- | --- |
+| audit | [audit.py](../questcollect/audit.py) | `audit_episode`: contact shares and events (from the recorded `contacts`, or by replaying `sim/state` for episodes older than schema v5), idle share, active range, level times, operator-driven runs. `audit_dir` caches by file size + mtime. `select` applies the `curate` rules and `curation.json` and returns `Segment`s plus a reason for every rejected episode. |
+| features | [learn/features.py](../questcollect/learn/features.py) | `FeatureSpec`: cameras, image size, joint/ee action, env state. The single definition of observation and action layout, used by export *and* the policy runner; stored in each dataset manifest, so a policy is always fed what it was trained on. |
+| export | [learn/export.py](../questcollect/learn/export.py) | per segment: `env_from_episode`, `set_state` each step, render `spec.cameras`, `LeRobotDataset.add_frame`. Optional `AppearanceRandomizer`. Refuses an existing folder; writes `questcollect_manifest.json`. All LeRobot dataset API calls are here. |
+| train | [learn/train.py](../questcollect/learn/train.py) | turns a preset from `learn.presets` into a `lerobot-train` command (output in `outputs/<run>/train/`) and writes `questcollect_run.json` (preset, dataset manifest, git commit, the command). |
+| policy | [learn/policy.py](../questcollect/learn/policy.py) | `PolicyRunner`: loads a checkpoint with its LeRobot pre/post-processors, renders the cameras at the dataset's size, returns joint targets (end-effector policies go through `BimanualIK`). Skips rendering while ACT still has queued actions. |
+| evaluate | [learn/evaluate.py](../questcollect/learn/evaluate.py) | rollouts on fixed seeds (`eval_seeds`, a separate stream from recording seeds), no wall clock; every action through the safety filter; metrics per rollout and summarized; rollouts saved with `make_step`, so `qc replay` and `qc audit` work on them. |
+
+**Safety filter** ([safety.py](../questcollect/safety.py)). One mink QP per control step (8 substeps, because the
+collision limits are linearized) on the robot-only scene: a posture task pulls towards the proposed joint targets,
+and limits keep joint ranges and speeds, the arms ≥ `safety.arm_margin` apart, the links ≥ `safety.table_margin`
+above the table, and the fingertips from pressing into it. In free motion the output equals the input. Its own
+configuration stays within `ik.max_lead` of the measured joints, like `BimanualIK.follow`.
+
+**Control modes** (`Runtime._who_drives`). `teleop`: the operator, as always. `policy`: `PolicyRunner.act` →
+`SafetyFilter.filter` every tick, buttons still work. `shared` (DAgger): the policy drives until an arm is engaged
+(Grip); while the policy drives, `Teleop.sync_hold` and `BimanualIK.reset` keep the operator side at the arms'
+current pose, so a takeover never jumps; when every arm is released the policy restarts with a fresh chunk. Each
+recorded step stores `control/source`, and `curate.dagger_frames: operator` exports only the operator's steps.
+`record.action_noise` (DART) perturbs the *executed* operator targets while recording; the clean ones are
+recorded.
 
 ## The web client
 
@@ -207,7 +251,7 @@ than 3 cm away from what the IK can reach, the arm is flagged *out of reach*.
 | `src/xr/visuals.ts` | controller models (vendored in `public/xr-profiles`), button hints, status chips, hand skeletons, pointer rays |
 | `src/xr/Hud.ts`, `GoalPanel.ts`, `WristMenu.ts`, `Panel.ts` | in-headset panels, drawn on canvases; ray and poke interaction |
 | `src/xr/sounds.ts` | synthesized sound cues (WebAudio, no audio files); cue names match the server's `sound` events |
-| `src/dashboard/` | the PC dashboard (React): live 3D view, camera previews, goal, recorder, teleop status, episode list |
+| `src/dashboard/` | the PC dashboard (React): live 3D view, camera previews, goal, recorder, teleop status and control mode, episode list with audit verdicts (`/api/audit`, `/api/curation`) |
 | `e2e/` | headset-free tests and README screenshots with an emulated Quest 3 (IWER + Playwright) |
 
 ## Common changes
@@ -220,18 +264,24 @@ than 3 cm away from what the IK can reach, the arm is flagged *out of reach*.
 | sounds | `CUES` in `web/src/xr/sounds.ts` | names must match the server's `sound` events |
 | controller buttons | `CONTROLLER_COMMANDS` in `teleop.py` **and** `HINTS` in `web/src/xr/visuals.ts` | |
 | the wire format | `protocol.py` **and** `web/src/protocol.ts` | keep `test_protocol_roundtrip` passing |
-| recorded fields | `Runtime._build_step`, the `recorder.py` docstring, bump `SCHEMA_VERSION` | |
-| export features | `questcollect/lerobot_export.py` | |
+| recorded fields | `recorder.make_step`, the `recorder.py` docstring, bump `SCHEMA_VERSION` | `audit.py` must still read older files |
+| what counts as a contact | `BimanualEnv.contact_flags` in `sim.py` | bump `AUDIT_VERSION` in `audit.py` so cached audits are redone |
+| which episodes / steps are trained on | `curate` in `config.yaml`; the rules in `audit.verdict` / `select` | |
+| policy inputs / outputs | `learn` in `config.yaml`; layout code in `learn/features.py` | affects new datasets only; old ones keep theirs |
+| training settings | `learn.presets` in `config.yaml`, or extra args to `qc train` | |
+| evaluation metrics | `learn/evaluate.py` (`RolloutResult`, `summarize`) | |
+| safety margins / limits | `safety` in `config.yaml`; `safety.py` | |
 
 Changing the scene's degrees of freedom (adding a brick, a joint) changes the size of `sim/state`. The exporter
-refuses episodes whose state size doesn't match the current scene, rather than replaying them wrongly.
+refuses episodes whose state size doesn't match the scene, rather than replaying them wrongly; any other scene
+change shows up as a `scene_hash` mismatch warning.
 
 ## Tests
 
 | Command | Covers |
 | --- | --- |
-| `uv run --group dev pytest` | frames, filters, clutch, mappers, protocol round-trip; scene build, brick physics, clicking, grasping, gripper speed, IK, state replay, scene export, recorder, haptics |
-| `MUJOCO_GL=egl uv run --group dev pytest` (with `uv sync --extra export`) | the above plus a LeRobot export |
+| `uv run --group dev pytest` | frames, filters, clutch, mappers, protocol round-trip; scene build, brick physics, clicking, grasping, gripper speed, IK, state replay, scene export, recorder, haptics; audit and selection; safety filter; control modes and takeover |
+| `MUJOCO_GL=egl uv run --extra learn --group dev pytest` | the above plus `test_learn.py`: tiny episodes → export → a 2-step `lerobot-train` → a short `qc eval` rollout |
 | `cd web && npm run typecheck` | TypeScript |
 | `cd web/e2e && npm test` | an emulated Quest 3 against a running server: controllers, hands, clutch, gripper, record → save (setup at the top of `emulated-quest.mjs`) |
 | `MUJOCO_GL=egl uv run python scripts/make_media.py` | builds the whole tower with the real IK and gripper; must print `success: True` |

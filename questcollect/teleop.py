@@ -260,6 +260,12 @@ class Teleop:
             st.gripper = 1.0
             st.hold_p, st.hold_R = ee_poses[a][0].copy(), ee_poses[a][1].copy()
 
+    def sync_hold(self, ee_poses: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
+        """Something else (a policy) moved the arms: hold where they are now, so taking control starts there."""
+        for a, st in self.arms.items():
+            if not st.clutch.engaged:
+                st.hold_p, st.hold_R = ee_poses[a][0].copy(), ee_poses[a][1].copy()
+
     def release_all(self) -> None:
         """Drop every clutch, e.g. after the mapping changed, so re-engaging starts from the held target."""
         for st in self.arms.values():

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "../net";
 import { bricksPlaced, drawGoal, levelStates } from "../goal";
-import { type EpisodeRow, fetchTask, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
+import { type AuditRows, type EpisodeRow, fetchTask, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
 import { Viewer3D, type ViewerHandle } from "./Viewer3D";
 
 type Toast = { id: number; text: string; kind: string };
@@ -222,6 +222,22 @@ function TeleopCard({ status, cmd }: { status: Status | null; cmd: (n: string, a
         <button className={s?.mode === "hands" ? "active" : ""} onClick={() => cmd("set_mode", { mode: "hands" })}>✋ Hand tracking</button>
       </div>
       {s?.mode_mismatch && <div className="alert warn">Input source doesn't match the mode — {s.mode === "hands" ? "put the controllers down" : "pick up the controllers"}.</div>}
+      {s?.control.policy && (
+        <>
+          <div className="seg">
+            {(["teleop", "shared", "policy"] as const).map((m) => (
+              <button key={m} className={s.control.mode === m ? "active" : ""} onClick={() => cmd("set_control_mode", { mode: m })}>
+                {{ teleop: "🧑 You drive", shared: "🤝 Shared", policy: "🤖 Policy" }[m]}
+              </button>
+            ))}
+          </div>
+          <div className="muted control-note">
+            Policy <b>{s.control.policy}</b> · driving now: <b>{s.control.driver === "policy" ? "policy" : "you"}</b>
+            {s.control.driver === "policy" && <> · safety Δ {s.control.safety_rad.toFixed(3)} rad</>}
+            {s.control.mode === "shared" && <> · press Grip to take over</>}
+          </div>
+        </>
+      )}
       <div className="arms">
         <ArmTile side="l" status={s} />
         <ArmTile side="r" status={s} />
@@ -266,10 +282,23 @@ function EpisodesCard({ episodes, status, cmd, refresh }: {
   const rows = episodes.slice().reverse();
   const ok = rows.filter((e) => e.success).length;
   const total = rows.reduce((a, e) => a + (e.duration_s || 0), 0);
+  const [audit, setAudit] = useState<AuditRows>({});
+  const loadAudit = useCallback(() => {
+    fetch("/api/audit").then((r) => r.json()).then(setAudit).catch(() => {});
+  }, []);
+  useEffect(loadAudit, [episodes.length, loadAudit]);
+  const used = rows.filter((e) => audit[e.file] && !audit[e.file].verdict).length;
   const del = async (p: string) => {
     if (!confirm(`Delete ${p.split("/").slice(-2).join("/")}?`)) return;
     await fetch(`/api/episodes?path=${encodeURIComponent(p)}`, { method: "DELETE" });
     refresh();
+  };
+  const toggleExclude = async (file: string) => {
+    await fetch("/api/curation", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file, exclude: !audit[file]?.excluded, note: "excluded on the dashboard" }),
+    });
+    loadAudit();
   };
   return (
     <div className="card episodes">
@@ -278,6 +307,7 @@ function EpisodesCard({ episodes, status, cmd, refresh }: {
         <div><b>{rows.length}</b><span>episodes</span></div>
         <div><b>{rows.length ? Math.round((100 * ok) / rows.length) : 0}%</b><span>success</span></div>
         <div><b>{fmt(total)}</b><span>total time</span></div>
+        <div title="Episodes a training dataset would use (qc audit)"><b>{used}</b><span>for training</span></div>
       </div>
       <div className="table">
         {rows.length === 0 && <div className="empty">No episodes yet — record your first demo.</div>}
@@ -286,8 +316,16 @@ function EpisodesCard({ episodes, status, cmd, refresh }: {
             <span className={`badge ${e.success ? "ok" : "warn"}`}>{e.success ? "✓" : "✗"}</span>
             <div className="ep-main">
               <b>{e.file.replace("episode_", "#").replace(".hdf5", "")}</b>
-              <span className="muted">{e.input_mode === "hands" ? "✋" : "🎮"} · {e.duration_s?.toFixed(1)} s</span>
+              <span className="muted">
+                {e.source === "policy" ? "🤖" : e.input_mode === "hands" ? "✋" : "🎮"} · {e.duration_s?.toFixed(1)} s
+                {audit[e.file] && <> · idle {Math.round(audit[e.file].idle_frac * 100)}%</>}
+              </span>
             </div>
+            {audit[e.file]?.verdict
+              ? <span className="badge warn" title={audit[e.file].verdict ?? ""}>⚠</span>
+              : audit[e.file] && <span className="badge ok" title="Used for training">✓</span>}
+            <button className="icon" title={audit[e.file]?.excluded ? "Use for training again" : "Exclude from training"}
+              onClick={() => toggleExclude(e.file)}>{audit[e.file]?.excluded ? "↺" : "⊘"}</button>
             <button className="icon" title="Replay in sim" disabled={status?.rec_state !== "idle"} onClick={() => cmd("replay", { path: e.path })}>▶</button>
             <button className="icon danger" title="Delete" onClick={() => del(e.path)}>🗑</button>
           </div>

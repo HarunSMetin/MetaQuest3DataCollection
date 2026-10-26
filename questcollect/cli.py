@@ -40,6 +40,9 @@ def serve(
     config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
     mode: Optional[str] = typer.Option(None, help="controllers | hands"),
     https: bool = typer.Option(True, help="Also serve HTTPS for Wi-Fi (needs `qc certs`)"),
+    policy: Optional[Path] = typer.Option(None, help="Trained policy run (outputs/<run>) to drive the arms; "
+                                                     "needs `uv sync --extra learn`"),
+    control: Optional[str] = typer.Option(None, help="teleop | policy | shared (default with --policy: shared)"),
 ):
     """Run the sim, teleop server, and web clients."""
     _headless_gl()
@@ -50,6 +53,11 @@ def serve(
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config)
+    if policy:
+        cfg.control.policy = str(policy)
+        cfg.control.mode = control or ("shared" if cfg.control.mode == "teleop" else cfg.control.mode)
+    elif control:
+        cfg.control.mode = control
     if mode:
         cfg.teleop.mode = mode
     runtime = Runtime(cfg)
@@ -172,23 +180,122 @@ def inspect(path: Path):
 
 
 @app.command()
-def export(
-    out: Path = typer.Option(ROOT / "data" / "lerobot", help="Output LeRobot dataset root"),
+def audit(
     raw: Optional[Path] = typer.Option(None, help="Episode folder (default: record.out_dir from the config)"),
-    repo_id: str = typer.Option("local/quest_bimanual_panda"),
-    action: str = typer.Option("joint", help="joint | ee"),
-    height: int = typer.Option(480),
-    width: int = typer.Option(640),
-    include_failures: bool = typer.Option(False),
+    config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
+    exclude: Optional[str] = typer.Option(None, help="Exclude this episode file from training datasets"),
+    include: Optional[str] = typer.Option(None, help="Undo a manual exclude"),
+    note: str = typer.Option("", help="Why (with --exclude)"),
+):
+    """Quality report of every episode (contacts, idle time, timing) and which ones a dataset would use."""
+    _headless_gl()
+    from questcollect.audit import audit_dir, select, set_curation
+
+    cfg = load_config(config)
+    folder = raw or cfg.out_dir
+    if exclude or include:
+        set_curation(folder, exclude or include, exclude is not None, note)
+    audits = audit_dir(folder, progress=lambda name: typer.echo(f"  auditing {name} …"))
+    segments, rejected = select(folder, audits, cfg.curate)
+    kept = {}
+    for s in segments:
+        kept[s.path.name] = kept.get(s.path.name, 0) + s.num_steps
+    typer.echo(f"\n{'episode':<22}{'length':>8}{'link-table':>12}{'arm-arm':>9}{'hand-table':>12}{'idle':>7}"
+               f"   levels at (s)          verdict")
+    for name, a in audits.items():
+        levels = " ".join("—" if t is None else f"{t:5.1f}" for t in a.level_times)
+        c = a.contact_frac
+        verdict = "✓ " + f"{kept[name] / a.fps:.0f} s used" if name in kept else "✗ " + rejected[name]
+        typer.secho(f"{name:<22}{a.duration_s:7.1f}s{c['link_table']:12.1%}{c['arm_arm']:9.1%}{c['tip_table']:12.1%}"
+                    f"{a.idle_frac:7.0%}   {levels:<22} {verdict}", fg=None if name in kept else "yellow")
+    fps = next(iter(audits.values())).fps if audits else 50
+    total = sum(a.num_steps for a in audits.values()) / fps / 60
+    used = sum(kept.values()) / fps / 60
+    typer.secho(f"\n{len(kept)} of {len(audits)} episodes used: {used:.1f} of {total:.1f} min "
+                f"({len(segments)} segments). Rules: `curate` in the config; manual excludes: --exclude.",
+                fg="green")
+
+
+@app.command()
+def export(
+    name: str = typer.Argument(..., help="Dataset name: written to <learn.datasets_dir>/<name>"),
+    config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
+    raw: Optional[Path] = typer.Option(None, help="Episode folder (default: record.out_dir from the config)"),
+    repo_id: Optional[str] = typer.Option(None, help="LeRobot repo id (default: local/<name>)"),
     randomize_visuals: bool = typer.Option(False, help="Vary lighting, colours and camera mounts per episode"),
 ):
-    """Episodes -> LeRobot dataset (cameras re-rendered from recorded sim states). Needs `uv sync --extra export`."""
+    """Selected episodes -> LeRobot dataset. Cameras, image size and action space: `learn` in the config;
+    which episodes and steps: `curate` (see `qc audit`). Needs `uv sync --extra learn`."""
     _headless_gl()
-    from questcollect.lerobot_export import export as export_lerobot
+    from questcollect.audit import audit_dir, select
+    from questcollect.learn.export import export as export_lerobot
+    from questcollect.learn.features import FeatureSpec
 
-    n = export_lerobot(raw or load_config().out_dir, out, repo_id, action=action, height=height, width=width,
-                       include_failures=include_failures, randomize_visuals=randomize_visuals)
+    cfg = load_config(config)
+    folder = raw or cfg.out_dir
+    segments, rejected = select(folder, audit_dir(folder), cfg.curate)
+    spec = FeatureSpec.from_config(cfg)
+    out = cfg.datasets_dir / name
+    typer.echo(f"{len(segments)} segments ({sum(s.num_steps for s in segments) / cfg.sim.control_hz / 60:.1f} min), "
+               f"{len(rejected)} episodes left out (`qc audit` shows why); cameras {list(spec.cameras)} at "
+               f"{spec.height}x{spec.width}, {spec.action} actions")
+    n = export_lerobot(segments, out, spec, repo_id or f"local/{name}", randomize_visuals=randomize_visuals,
+                       extra_manifest={"curate": cfg.curate.model_dump(), "rejected": rejected},
+                       progress=lambda i, total, seg: typer.echo(f"  [{i}/{total}] {seg.path.name} "
+                                                                 f"{seg.start}-{seg.stop}"))
     typer.secho(f"exported {n} episodes to {out}", fg="green")
+
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def train(
+    ctx: typer.Context,
+    dataset: str = typer.Argument(..., help="Dataset name in learn.datasets_dir (from `qc export`)"),
+    preset: str = typer.Option("act_240", help="Preset in learn.presets of the config"),
+    name: Optional[str] = typer.Option(None, help="Run name (default: date_preset_dataset)"),
+    config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
+    dry_run: bool = typer.Option(False, help="Only print the lerobot-train command"),
+):
+    """Train a policy with lerobot-train. Extra --key=value arguments are passed through to lerobot-train."""
+    from questcollect.learn.train import train as train_run
+
+    run = train_run(load_config(config), preset, dataset, name=name, extra=list(ctx.args), dry_run=dry_run)
+    if not dry_run:
+        typer.secho(f"run finished: {run}  ->  qc eval {run}", fg="green")
+
+
+@app.command("eval")
+def eval_(
+    run: Path = typer.Argument(..., help="Run folder (outputs/<run>) or a checkpoint folder"),
+    n: int = typer.Option(50, help="Number of rollouts (fixed held-out seeds)"),
+    config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
+    max_seconds: Optional[float] = typer.Option(None, help="Rollout time limit (default: 1.5 x the 95th "
+                                                           "percentile training episode)"),
+    safety: bool = typer.Option(True, help="Filter actions with the safety filter (safety in the config)"),
+    ensemble: Optional[float] = typer.Option(None, help="ACT temporal ensembling coefficient, e.g. 0.01"),
+    n_action_steps: Optional[int] = typer.Option(None, help="Steps executed per predicted chunk"),
+    save_rollouts: bool = typer.Option(True, help="Save every rollout as an episode file"),
+):
+    """Evaluate a trained policy in simulation: success rate, stage reached, contacts, safety interventions."""
+    _headless_gl()
+    from questcollect.learn.evaluate import evaluate
+    from questcollect.sim import LEVELS
+
+    cfg = load_config(config)
+
+    def show(i, total, r):
+        typer.echo(f"  [{i}/{total}] seed {r.seed:>10}  {'✓' if r.success else '✗'}  {r.duration_s:6.1f}s  "
+                   f"base {'in' if r.base_in_area else 'out'}  levels {r.max_progress}/{LEVELS}  "
+                   f"contacts {r.contact_events}  safety max {r.safety_max_rad:.3f} rad")
+
+    max_steps = int(max_seconds * cfg.sim.control_hz) if max_seconds else None
+    summary, out = evaluate(run, cfg, n=n, max_steps=max_steps, use_safety=safety, save_rollouts=save_rollouts,
+                            temporal_ensemble=ensemble, n_action_steps=n_action_steps, progress=show)
+    st = summary["stage_rates"]
+    typer.secho(f"\nsuccess {summary['success_rate']:.0%}  |  base in area {st['base_in_area']:.0%}  "
+                + "  ".join(f"level {k} {st[f'level_{k}']:.0%}" for k in range(1, LEVELS + 1)), fg="green", bold=True)
+    typer.echo(f"rollouts with contact: {summary['rollouts_with_contact']}  safety mean "
+               f"{summary['safety_mean_rad']:.4f} rad, max {summary['safety_max_rad']:.3f} rad")
+    typer.echo(f"results: {out}/metrics.json" + ("  (rollouts: qc replay <file>)" if save_rollouts else ""))
 
 
 @app.command()

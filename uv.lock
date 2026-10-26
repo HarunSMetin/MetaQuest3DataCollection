@@ -1606,7 +1606,7 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-export = [
+learn = [
     { name = "lerobot" },
 ]
 
@@ -1621,7 +1621,7 @@ requires-dist = [
     { name = "fast-simplification", specifier = ">=0.2.0" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "h5py", specifier = ">=3.10" },
-    { name = "lerobot", marker = "extra == 'export'" },
+    { name = "lerobot", marker = "extra == 'learn'" },
     { name = "mink", specifier = ">=0.0.5" },
     { name = "mujoco", specifier = ">=3.2" },
     { name = "numpy", specifier = ">=1.26" },
@@ -1631,7 +1631,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.12" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
 ]
-provides-extras = ["export"]
+provides-extras = ["learn"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

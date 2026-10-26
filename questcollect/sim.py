@@ -6,14 +6,20 @@ World frame: z up, +x points away from the operator (towards the far table edge)
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import io
+import logging
 from typing import NamedTuple
 
 import mujoco
 import numpy as np
+import yaml
 from PIL import Image
 
-from questcollect.config import ROOT, Config, SimConfig
+from questcollect.config import ROOT, Config, SimConfig, load_config
+
+log = logging.getLogger(__name__)
 
 PANDA_XML = ROOT / "assets" / "third_party" / "mujoco_menagerie" / "franka_emika_panda" / "panda.xml"
 
@@ -524,6 +530,17 @@ class BimanualEnv:
         self.mj_state_size = mujoco.mj_stateSize(m, STATE_SPEC)
         self.state_size = self.mj_state_size + 7 * len(CLUTCH_PAIRS)
         self.seed: int | None = None
+        # contact_flags(): which arm each body belongs to (0 none, 1 left, 2 right), and hand/fingers vs links.
+        names = [m.body(b).name for b in range(m.nbody)]
+        self._body_arm = np.array([1 if n.startswith("l_") else 2 if n.startswith("r_") else 0 for n in names])
+        self._body_tip = np.array([n.endswith(("_hand", "_left_finger", "_right_finger")) for n in names])
+        self._table_body = m.body("table").id
+
+    @functools.cached_property
+    def scene_hash(self) -> str:
+        """Fingerprint of this scene as it is saved with episodes (computed from the saved MJCF, so a recorded
+        episode and today's scene are compared through the same path)."""
+        return scene_hash(load_recorded_model(self.xml))
 
     def reset(self, seed: int | None = None) -> dict:
         self.seed = int(seed) if seed is not None else int(np.random.SeedSequence().entropy % (2**31))
@@ -651,6 +668,22 @@ class BimanualEnv:
     def held(self) -> dict[str, int | None]:
         return held_bricks(self.model, self.data)
 
+    def contact_flags(self) -> np.ndarray:
+        """(3,) bool for the current contacts: [an arm link on the table, the two arms touching (hand-hand and
+        finger-finger excepted), a hand or fingertip on the table]. The one definition used by the headset
+        warnings, the recorded `contacts`, the audit and the policy evaluation."""
+        d = self.data
+        b1, b2 = self.model.geom_bodyid[d.contact.geom1], self.model.geom_bodyid[d.contact.geom2]
+        arm1, arm2 = self._body_arm[b1], self._body_arm[b2]
+        tip1, tip2 = self._body_tip[b1], self._body_tip[b2]
+        arm_arm = (arm1 * arm2 == 2) & ~(tip1 & tip2)
+        table = self._table_body
+        other = np.where(b1 == table, b2, b1)
+        on_table = (b1 == table) | (b2 == table)
+        link_table = on_table & (self._body_arm[other] > 0) & ~self._body_tip[other]
+        tip_table = on_table & self._body_tip[other]
+        return np.array([link_table.any(), arm_arm.any(), tip_table.any()])
+
     # Full state, for exact replay and offline re-rendering.
     def get_state(self) -> np.ndarray:
         s = np.empty(self.mj_state_size)
@@ -662,6 +695,39 @@ class BimanualEnv:
         self.model.eq_data[self.clutch_eqs, 3:10] = state[self.mj_state_size:].reshape(-1, 7)
         mujoco.mj_setState(self.model, self.data, state[:self.mj_state_size], STATE_SPEC)
         mujoco.mj_forward(self.model, self.data)
+
+
+# -- recorded scenes -------------------------------------------------------------------------------
+def scene_hash(model: mujoco.MjModel) -> str:
+    """Fingerprint of what shapes the physics and the images (geoms, masses, materials, cameras, state layout).
+    Stored with every episode, so replaying or re-rendering it in a changed scene is caught."""
+    h = hashlib.sha1()
+    for arr in (model.geom_type, model.geom_bodyid, model.geom_contype, model.geom_conaffinity,
+                model.geom_size.round(6), model.geom_pos.round(6), model.body_mass.round(6),
+                model.mat_rgba.round(4), model.cam_pos.round(6)):
+        h.update(np.ascontiguousarray(arr).tobytes())
+    h.update(str(mujoco.mj_stateSize(model, STATE_SPEC)).encode())
+    return h.hexdigest()[:16]
+
+
+def load_recorded_model(xml: str) -> mujoco.MjModel:
+    """Compile an episode's saved MJCF (meta `model_xml`). It names the Franka meshes by file name only, so
+    they are passed in from the Menagerie folder (fetched by scripts/fetch_assets.sh)."""
+    assets = {p.name: p.read_bytes() for p in (PANDA_XML.parent / "assets").iterdir()}
+    return mujoco.MjModel.from_xml_string(xml, assets)
+
+
+def env_from_episode(meta: dict) -> BimanualEnv:
+    """The environment an episode was recorded in: built from its saved config (not today's config.yaml), and
+    checked against its saved scene fingerprint (`env.scene_matches`; a mismatch is logged)."""
+    cfg = Config.model_validate(yaml.safe_load(meta["config_yaml"])) if meta.get("config_yaml") else load_config()
+    env = BimanualEnv(cfg)
+    want = meta.get("scene_hash") or scene_hash(load_recorded_model(meta["model_xml"]))
+    env.scene_matches = want == env.scene_hash
+    if not env.scene_matches:
+        log.warning("episode recorded in a different scene (hash %s, now %s): replays may differ", want,
+                    env.scene_hash)
+    return env
 
 
 class AppearanceRandomizer:

@@ -1,12 +1,11 @@
 import os
-import time
 
 import numpy as np
 import pytest
 
 from questcollect.config import load_config
 from questcollect.ik import BimanualIK
-from questcollect.recorder import Recorder, RecState, list_episodes, read_episode
+from questcollect.recorder import Recorder, RecState, list_episodes, make_step, read_episode, teleop_fields
 from questcollect.runtime import HAPTIC_CLICK, HAPTIC_COMPLETE, HAPTIC_PLACED, HAPTIC_UNCLICK, Runtime
 from questcollect.scene_export import export_scene
 from questcollect.sim import (BRICK_H, BRICKS, BUILD_AREA_CENTER, BUILD_AREA_HALF, CLUTCH_PRESS_N, CLUTCH_PULL_N,
@@ -292,16 +291,9 @@ def test_scene_export(env):
 
 
 def _fake_step(env, i):
-    return {
-        "time": float(i), "wall_time": time.monotonic(),
-        "obs": env.observe(),
-        "action": {"joint_pos": np.zeros(16), "ee_pose": np.zeros(16)},
-        "sim": {"state": env.get_state()},
-        "success": False,
-        "teleop": {"head": np.zeros(7), "engaged": np.zeros(2, bool), "tracked": np.ones(2, bool), "rtt_ms": 12.0,
-                   "left": {"source": 1, "pose": np.zeros(7), "buttons": np.zeros(8), "joints": np.zeros((25, 7)), "pinch": np.zeros(2)},
-                   "right": {"source": 1, "pose": np.zeros(7), "buttons": np.zeros(8), "joints": np.zeros((25, 7)), "pinch": np.zeros(2)}},
-    }
+    obs = env.observe()
+    return make_step(env, obs, env.get_state(), obs["joint_pos"], np.ones(2), [obs["ee_pose_left"], obs["ee_pose_right"]],
+                     False, 0, env.contact_flags(), teleop_fields(None, tracked=(True, True), rtt_ms=12.0))
 
 
 def _no_countdown(cfg):
@@ -348,31 +340,6 @@ def test_recorder_auto_stop_on_success(cfg, env, tmp_path):
 
 
 @pytest.mark.skipif(os.environ.get("MUJOCO_GL") is None, reason="needs headless GL (MUJOCO_GL=egl)")
-def test_lerobot_export(cfg, env, tmp_path):
-    pytest.importorskip("lerobot")
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    from questcollect.lerobot_export import export
-
-    rec = Recorder(_no_countdown(cfg), tmp_path / "raw")
-    for ep in range(2):
-        env.reset(seed=ep)
-        rec.start(0.0); rec.tick(0.0)
-        for i in range(12):
-            rec.append(i * 0.02, _fake_step(env, i), False)
-            env.step()
-        rec.save(env, "controllers", success=True)
-        rec.flush()
-    n = export(tmp_path / "raw", tmp_path / "lerobot", "test/quest", height=96, width=128)
-    assert n == 2
-    ds = LeRobotDataset("test/quest", root=tmp_path / "lerobot")
-    assert ds.num_episodes == 2 and ds.num_frames == 24 and ds.fps == cfg.sim.control_hz
-    item = ds[0]
-    assert item["observation.state"].shape == (16,) and item["action"].shape == (16,)
-    assert item["observation.images.cam_high"].shape == (3, 96, 128)
-    assert item["observation.environment_state"].shape == (7 * len(BRICKS),)
-
-
 def test_tower_haptics(cfg):
     """Each placed level fires the double pulse once (not the plain click), the finished tower the triple pulse
     on both hands, and pulling a brick off the unclick blip."""

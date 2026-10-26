@@ -1,4 +1,4 @@
-"""Real-time sim thread: input -> teleop -> IK -> physics -> recording -> publish.
+"""Real-time sim thread: input -> teleop -> IK (or policy -> safety filter) -> physics -> recording -> publish.
 
 The network layer talks to this only through thread-safe methods (submit_input, command,
 latest_pose_frame, status, previews) and event listeners.
@@ -10,6 +10,7 @@ import logging
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -18,7 +19,9 @@ from questcollect.config import Config
 from questcollect.frames import mat_to_quat_wxyz, quat_wxyz_to_mat
 from questcollect.ik import BimanualIK
 from questcollect.protocol import FLAG_ENGAGED_L, FLAG_ENGAGED_R, FLAG_RECORDING, InputFrame, pack_pose_frame
-from questcollect.recorder import Recorder, RecState, list_episodes, read_episode
+from questcollect.recorder import (SOURCE_OPERATOR, SOURCE_POLICY, Recorder, RecState, list_episodes, make_step,
+                                   read_episode, teleop_fields)
+from questcollect.safety import SafetyFilter
 from questcollect.scene_export import body_poses, export_scene
 from questcollect.sim import ARMS, BRICKS, INSTRUCTION, LEVELS, TASK, BimanualEnv, CameraRenderer, task_spec
 from questcollect.teleop import Teleop
@@ -29,6 +32,7 @@ STATUS_EVERY = 5          # ticks (10 Hz at 50 Hz control)
 PREVIEW_EVERY = 6         # ticks (~8 Hz)
 PREVIEW_SIZE = (240, 320)
 IK_WARN_M = 0.03
+CONTROL_MODES = ("teleop", "policy", "shared")  # shared: the policy drives until the operator takes control
 # Task haptics: (intensity, ms, repeat, gap_ms). Distinct patterns so the operator can tell them apart.
 # Most come with a sound cue of the same name (web/src/xr/sounds.ts), panned to that arm's side.
 HAPTIC_GRASP = (0.5, 40, 1, 0)        # fingers closed on a brick
@@ -57,11 +61,20 @@ class Runtime:
         self.ik = BimanualIK(cfg.sim, cfg.ik, self.dt)
         self.recorder = Recorder(cfg, cfg.out_dir)
         self._scene_json, self._scene_blob = export_scene(self.env.model)
-
-        m = self.env.model
-        self._arm_bodies = {a: {b for b in range(m.nbody) if m.body(b).name.startswith(f"{a}_")} for a in ARMS}
-        self._finger_bodies = {b for b in range(m.nbody) if "finger" in m.body(b).name}
-        self._table_body = m.body("table").id
+        # Who drives: the operator (teleop), a trained policy, or the policy until the operator takes over (shared).
+        self.safety = SafetyFilter(cfg.sim, cfg.ik, cfg.safety, self.dt)
+        self.policy = None  # learn.policy.PolicyRunner, see load_policy
+        self.control_mode = "teleop"
+        self._driver = "operator"
+        self._safety_rad = 0.0
+        self._noise = np.random.default_rng()
+        if cfg.control.policy:
+            self.load_policy(cfg.control.policy)
+            self.control_mode = cfg.control.mode
+        elif cfg.control.mode != "teleop":
+            log.warning("control.mode %s needs a policy (qc serve --policy outputs/<run>); using teleop",
+                        cfg.control.mode)
+        _ = self.env.scene_hash  # compiles the scene once more (~0.2 s): now, not on the first save mid-session
 
         self._input: InputFrame | None = None
         self._input_lock = threading.Lock()
@@ -94,6 +107,12 @@ class Runtime:
         self._hold_tick_at = {a: 0.0 for a in ARMS}
         self._quiet_until = {a: 0.0 for a in ARMS}
         self._reset_scene()
+
+    def load_policy(self, run: str | Path) -> None:
+        """Load a trained policy (`qc serve --policy outputs/<run>`). Imports torch, so only when asked."""
+        from questcollect.learn.policy import PolicyRunner
+
+        self.policy = PolicyRunner(Path(run), self.cfg, n_action_steps=self.cfg.control.n_action_steps)
 
     # -- public, thread-safe ---------------------------------------------------------------------
     def start(self) -> None:
@@ -182,6 +201,7 @@ class Runtime:
         self._base_in_area = False
         self.ik.reset(obs["joint_pos"])
         self.teleop.reset({a: self._ik_pose(a) for a in ARMS})
+        self._driver = "operator"  # a policy starts a fresh chunk on its first tick
 
     def _ik_pose(self, arm: str) -> tuple[np.ndarray, np.ndarray]:
         p, q = self.ik.tcp_pose(arm)
@@ -229,7 +249,7 @@ class Runtime:
             if was == RecState.IDLE and rec.state == RecState.COUNTDOWN:
                 self._toast("Get ready…")
         elif name == "save":
-            path = rec.save(self.env, self.teleop.mode, kw.get("success"))
+            path = rec.save(self.env, self.teleop.mode, kw.get("success"), source=self.control_mode)
             if path:
                 self._emit({"type": "saved", "path": path})
                 self._toast(f"Saved {path.rsplit('/', 1)[-1]}", "success")
@@ -265,6 +285,15 @@ class Runtime:
         elif name == "replay_stop":
             self._replay = None
             self._reset_scene()
+        elif name == "set_control_mode":
+            mode = kw.get("mode", "teleop")
+            if mode != "teleop" and self.policy is None:
+                self._toast("No policy loaded: start with qc serve --policy outputs/<run>", "warn")
+            elif mode in CONTROL_MODES and mode != self.control_mode:
+                self.control_mode = mode
+                self.teleop.release_all()
+                self._toast({"teleop": "You drive", "policy": "Policy drives",
+                             "shared": "Policy drives: take over any time with Grip"}[mode], "info")
 
     def _tick(self, now: float) -> None:
         self._process_commands(now)
@@ -294,11 +323,27 @@ class Runtime:
                 self._sound("engage" if out.engaged[a] else "disengage", a)
         self._engaged = dict(out.engaged)
 
-        for a in ARMS:
-            p, R = out.targets[a]
-            self.ik.set_target(a, p, mat_to_quat_wxyz(R))
-        self.ik.follow(env.data.qpos[env.arm_qadr])
-        q_target = self.ik.solve()
+        q_measured = env.data.qpos[env.arm_qadr].copy()
+        driver = self._who_drives(out)
+        if driver == "policy":
+            if self._driver != "policy":  # (re)starting: a fresh chunk from the current state
+                self.policy.reset(env)
+                self.safety.reset(q_measured)
+            q_policy, grippers = self.policy.act(env)
+            q_target, self._safety_rad = self.safety.filter(q_policy, q_measured)
+            ee = self.safety.tcp_poses()
+            # Keep the operator side where the arms are, so taking control (Grip) never makes them jump.
+            self.ik.reset(q_target)
+            self.teleop.sync_hold({a: self._ik_pose(a) for a in ARMS})
+        else:
+            for a in ARMS:
+                p, R = out.targets[a]
+                self.ik.set_target(a, p, mat_to_quat_wxyz(R))
+            self.ik.follow(q_measured)
+            q_target, grippers = self.ik.solve(), out.grippers
+            self._safety_rad = 0.0
+            ee = [np.concatenate([p, mat_to_quat_wxyz(R)]) for p, R in (out.targets[a] for a in ARMS)]
+        self._driver = driver
 
         prev_state = self.recorder.state
         self.recorder.tick(now)
@@ -310,11 +355,21 @@ class Runtime:
         if recording:
             obs = env.observe()
             state = env.get_state()
-        env.apply_action(q_target, out.grippers)
+            contacts = env.contact_flags()
+        q_exec = q_target
+        if recording and driver == "operator" and self.cfg.record.action_noise > 0:
+            # DART: execute a slightly perturbed target but record the operator's clean one, so the data shows
+            # how the operator recovers from small errors (Laskey et al., 2017).
+            q_exec = q_target + self._noise.normal(0.0, self.cfg.record.action_noise, q_target.shape)
+        env.apply_action(q_exec, grippers)
         success = env.success()
 
         if recording:
-            step = self._build_step(obs, state, out, frame, q_target, success)
+            teleop = teleop_fields(frame, [out.engaged[a] for a in ARMS], [out.tracked[a] for a in ARMS],
+                                   self._rtt_ms)
+            source = SOURCE_POLICY if driver == "policy" else SOURCE_OPERATOR
+            step = make_step(env, obs, state, q_target, grippers, ee, success, self._progress, contacts, teleop,
+                             source)
             if self.recorder.append(now, step, success):
                 self._toast("Success! Save (X) or discard (B)", "success")
 
@@ -323,40 +378,12 @@ class Runtime:
         self._check_warnings(now)
         self._publish(now, out, success)
 
-    def _build_step(self, obs: dict, state: np.ndarray, out, frame: InputFrame | None, q_target,
-                    success: bool) -> dict:
-        ee_act = []
-        for a in ARMS:
-            p, R = out.targets[a]
-            ee_act.append(np.concatenate([p, mat_to_quat_wxyz(R)]))
-        g = out.grippers
-        teleop = {"head": np.zeros(7) if frame is None else frame.head,
-                  "engaged": np.array([out.engaged[a] for a in ARMS]),
-                  "tracked": np.array([out.tracked[a] for a in ARMS]),
-                  "rtt_ms": self._rtt_ms}
-        for side, a in (("left", "l"), ("right", "r")):
-            h = frame.hand(a) if frame is not None else None
-            teleop[side] = {
-                "source": 0 if h is None else h.source,
-                "pose": np.zeros(7) if h is None else h.pose,
-                "buttons": np.zeros(8) if h is None else h.buttons,
-                "joints": np.zeros((25, 7)) if h is None else h.joints,
-                "pinch": np.zeros(2) if h is None else h.pinch,
-            }
-        return {
-            "time": self.env.data.time,
-            "wall_time": time.monotonic(),
-            "obs": obs,
-            "action": {
-                "joint_pos": np.concatenate([q_target[:7], g[:1], q_target[7:], g[1:]]),
-                "ee_pose": np.concatenate([ee_act[0], ee_act[1], g]),
-            },
-            "sim": {"state": state},
-            "success": success,
-            "progress": self._progress,
-            "clutch": self.env.data.eq_active[self.env.clutch_eqs].copy(),
-            "teleop": teleop,
-        }
+    def _who_drives(self, out) -> str:
+        if self.policy is None or self.control_mode == "teleop":
+            return "operator"
+        if self.control_mode == "shared" and any(out.engaged.values()):
+            return "operator"  # DAgger: the operator took over; the policy resumes when every arm is released
+        return "policy"
 
     def _pattern(self, arm: str | None, pattern: tuple, now: float, sound: str | None = None) -> None:
         intensity, ms, repeat, gap = pattern
@@ -408,15 +435,8 @@ class Runtime:
         self._complete = success
 
     def _check_warnings(self, now: float) -> None:
-        d = self.env.data
-        left, right = self._arm_bodies["l"], self._arm_bodies["r"]
-        geom_body = self.env.model.geom_bodyid
-        arm_hit = table_hit = False
-        for x, y in zip(geom_body[d.contact.geom1], geom_body[d.contact.geom2]):
-            if (x in left and y in right) or (x in right and y in left):
-                arm_hit |= not (x in self._finger_bodies and y in self._finger_bodies)
-            other = y if x == self._table_body else x if y == self._table_body else None
-            table_hit |= other in left or other in right
+        link_table, arm_hit, tip_table = (bool(f) for f in self.env.contact_flags())
+        table_hit = link_table or tip_table
         reach = {a: e[0] > IK_WARN_M for a, e in self.ik.errors().items()}
         new = {"arm_collision": arm_hit, "table_collision": table_hit, "ik_saturated": any(reach.values())}
         for k, v in new.items():
@@ -493,6 +513,9 @@ class Runtime:
             "loop_hz": round(self._loop_hz, 1),
             "connected": rate > 0,
             "placement": self.placement.column_major(),
+            "control": {"mode": self.control_mode, "driver": self._driver,
+                        "policy": None if self.policy is None else self.policy.name,
+                        "safety_rad": round(self._safety_rad, 3)},
             "replay": None if self._replay is None else {
                 "path": self._replay["path"], "i": self._replay["i"], "n": len(self._replay["states"])},
         }

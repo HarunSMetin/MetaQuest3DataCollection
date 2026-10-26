@@ -12,9 +12,10 @@ from questcollect.sim import ARM_JOINTS, ARMS, HOME_Q, build_spec
 COLLISION_BODIES = ("link4", "link5", "link6", "link7", "hand", "left_finger", "right_finger")
 
 
-def _collision_geoms(model: mujoco.MjModel, arm: str) -> list[int]:
+def collision_geoms(model: mujoco.MjModel, arm: str, bodies=COLLISION_BODIES) -> list[int]:
+    """Colliding geoms of the given bodies of one arm (shared with safety.py)."""
     ids = []
-    for b in COLLISION_BODIES:
+    for b in bodies:
         bid = model.body(f"{arm}_{b}").id
         ids += [g for g in mink.get_body_geom_ids(model, bid) if model.geom_contype[g] or model.geom_conaffinity[g]]
     return ids
@@ -42,7 +43,7 @@ class BimanualIK:
         self.limits = [mink.ConfigurationLimit(m), mink.VelocityLimit(m, vel)]
         if cfg.avoid_arm_collisions:  # otherwise the arms collide in the physics, like real ones
             self.limits.append(mink.CollisionAvoidanceLimit(
-                m, geom_pairs=[(_collision_geoms(m, "l"), _collision_geoms(m, "r"))],
+                m, geom_pairs=[(collision_geoms(m, "l"), collision_geoms(m, "r"))],
                 minimum_distance_from_collisions=cfg.collision_margin,
                 collision_detection_distance=cfg.collision_margin + 0.08,
             ))
