@@ -75,7 +75,13 @@ mj.root.add(goal.panel.mesh);
 const sounds = new Sounds();
 
 const sampler = new XRInputSampler();
-const handViz: Record<Side, HandViz> = { left: new HandViz(ARM_COLORS.l), right: new HandViz(ARM_COLORS.r) };
+const handViz: Record<Side, HandViz> = { left: new HandViz(ARM_COLORS.l, "l"), right: new HandViz(ARM_COLORS.r, "r") };
+const HINTS_KEY = "qc.hints";
+function setHints(on: boolean) {
+  for (const s of ["left", "right"] as Side[]) handViz[s].showHints = on;
+  try { localStorage.setItem(HINTS_KEY, on ? "on" : "off"); } catch { /* storage unavailable */ }
+}
+try { if (localStorage.getItem(HINTS_KEY) === "off") setHints(false); } catch { /* storage unavailable */ }
 const pointers: Record<Side, Pointer> = { left: new Pointer(ARM_COLORS.l), right: new Pointer(ARM_COLORS.r) };
 for (const s of ["left", "right"] as Side[]) scene.add(handViz[s].group, pointers[s].group);
 
@@ -98,6 +104,8 @@ const link = new Link("/ws/xr", {
     hud.update(s);
     goal.update(s);
     menu.update(s);
+    handViz.left.setStatus(s);
+    handViz.right.setStatus(s);
     updateLanding();
   },
   onEvent: (e: ServerEvent) => {
@@ -112,7 +120,7 @@ const link = new Link("/ws/xr", {
   },
   // (Re)load the scene on every connect, so a restarted server with a changed scene is picked up.
   onOpen: () => { mj.load(); fetchTask().then((t) => goal.setTask(t)).catch(() => {}); updateLanding(); },
-  onClose: () => { status = null; updateLanding(); },
+  onClose: () => { status = null; handViz.left.setStatus(null); handViz.right.setStatus(null); updateLanding(); },
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -123,6 +131,8 @@ const menu = new WristMenu({
   exit: () => renderer.xr.getSession()?.end(),
   toggleSound: () => sounds.toggle(),
   soundOn: () => sounds.enabled,
+  toggleHints: () => setHints(!handViz.left.showHints),
+  hintsOn: () => handViz.left.showHints,
 });
 scene.add(menu.panel.mesh);
 
@@ -224,8 +234,9 @@ renderer.setAnimationLoop((_t, frame?: XRFrame) => {
     placeMenu();
     interact();
     link.sendBinary(packer.pack(sampler.head, sampler.hands.left, sampler.hands.right, lastServerT));
-    handViz.left.update(sampler.hands.left, sampler.radii.left, mj.engaged.l);
-    handViz.right.update(sampler.hands.right, sampler.radii.right, mj.engaged.r);
+    tmpQ.fromArray(sampler.head, 3);
+    handViz.left.update(sampler.hands.left, sampler.radii.left, mj.engaged.l, sampler.sources.left, tmpQ);
+    handViz.right.update(sampler.hands.right, sampler.radii.right, mj.engaged.r, sampler.sources.right, tmpQ);
   } else {
     // Landing-page preview: slow orbit around the robots.
     const a = now / 9000;

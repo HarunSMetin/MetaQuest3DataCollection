@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 QuestCollect: teleoperate two simulated Franka Panda arms (MuJoCo) from a Meta Quest 3 via a WebXR page, record
 demonstrations of one task (`build_tower`: stack 4 DUPLO bricks into a fixed tower) to HDF5, export to LeRobot.
 Python 3.12 backend in a flat package (`questcollect/`, one module per pipeline stage), TypeScript/three.js/React
-frontend (`web/`). The README is the user-facing doc (GitHub); keep it in sync with behaviour changes.
+frontend (`web/`). Two human docs, keep both in sync with behaviour changes: `README.md` (users: install, controls,
+data format, config table, troubleshooting) and `docs/architecture.md` (developers: tick order, threads, endpoints,
+protocol, frames, "Common changes" table of files that change together).
 
 ## Commands
 
@@ -30,12 +32,14 @@ MUJOCO_GL=egl uv run python scripts/make_media.py   # docs/media: demo.gif, towe
 ```
 
 `scripts/make_media.py` builds the whole tower with the real IK + gripper stack and prints `demo progress: 3/3 ...
-success: True`; it's a good end-to-end check after changing brick physics, grasping or IK.
+success: True`; it's a good end-to-end check after changing brick physics, grasping or IK. The GIF palette must
+include brick-colour swatches (`gif_palette`), or the small bricks quantize to grey.
 
 Headset-free end-to-end test (emulated Quest 3 via Meta's IWER + Playwright): setup is at the top of
 `web/e2e/emulated-quest.mjs` (`npm install && npx playwright install chromium && npm run build`, then
 `uv run qc serve --no-https --config <yaml with a scratch record.out_dir>`, then `npm test`). It writes episodes to
-the server's out_dir. `npm run screenshots` overwrites the PNGs in `docs/media/`.
+the server's out_dir. `npm run screenshots` overwrites `dashboard.png`, `xr_landing.png`, `xr_headset.png` and
+`xr_menu.png` in `docs/media/`; under software GL the emulated input runs at ~1 Hz, so arms may show as idle/lost.
 
 ## Architecture
 
@@ -51,6 +55,9 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
 - **Scene + task**: `sim.py` builds the scene programmatically with `MjSpec` (ALOHA-style side-by-side arms) and
   holds the one task (`BRICKS`/`TOWER` constants, `_add_task`, `_randomize_task`, `tower_progress`, `held_bricks`,
   `_task_success`). Bricks are real DUPLO parts (BrickLink masses) with collision studs; body frame = bottom centre.
+  Each brick also has an invisible solid `<brick>_core` filling its hollow underside that only robot geoms hit
+  (`ROBOT_CONTYPE`/`CORE_CONAFFINITY` bits), and the Menagerie fingertip pads are merged into one flat box: both
+  stop bricks from hooking onto an open gripper when pressed hard.
   Build area (`BUILD_AREA_*`, tape geoms in group 1, so cameras see it): `tower_progress` is 0 unless
   `in_build_area` (whole base footprint inside); `_randomize_task` never spawns bricks in it. Geom group 5
   (`OPERATOR_GROUP`) = headset/dashboard-only visuals (MuJoCo cameras render groups 0–2).
@@ -81,6 +88,11 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   `{"type": "sound", name, arm}` events (engage/disengage, those task events, `area`, collision/table/out_of_reach
   warnings, rate-limited by `WARN_SOUND_GAP_S`) are synthesized with WebAudio in `web/src/xr/sounds.ts` (cue names must
   match); audio is unlocked by the Enter VR click, muted via the wrist menu (localStorage).
+- **Controller visuals** (`web/src/xr/visuals.ts` `HandViz`): real Touch Plus models via three's
+  `XRControllerModelFactory`, assets vendored in `web/public/xr-profiles` (no CDN; `profilesList.json` trimmed to
+  `meta-quest-touch-plus`, the capsule is the fallback). Per-button callouts (`HINTS`, labels mirror
+  `CONTROLLER_COMMANDS` in `teleop.py`; keep them in sync) are laid out in view space each frame, plus a status chip
+  and an engaged/out-of-reach emissive glow.
 - **Teleop** (`teleop.py`): One-Euro filters, `ArmClutch` (relative motion, no jump on re-engage), controller (Grip
   press toggles the clutch) and hand (thumb-middle pinch toggles) mappers, and `Teleop` (stale-input disengage, jump rejection, workspace clamp, mode-mismatch detection).
   `frames.py` converts XR local-floor ↔ MuJoCo world and owns table placement/recenter.

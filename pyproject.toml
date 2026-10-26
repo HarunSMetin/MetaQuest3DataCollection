@@ -2,6 +2,8 @@
 name = "questcollect"
 version = "0.1.0"
 description = "Meta Quest 3 teleoperation + data collection for bimanual Franka in MuJoCo"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "mujoco>=3.2",

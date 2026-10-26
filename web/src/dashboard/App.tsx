@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "../net";
-import { drawGoal, levelStates } from "../goal";
+import { bricksPlaced, drawGoal, levelStates } from "../goal";
 import { type EpisodeRow, fetchTask, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
 import { Viewer3D, type ViewerHandle } from "./Viewer3D";
 
@@ -191,7 +191,7 @@ function RecorderCard({ status, cmd }: { status: Status | null; cmd: (n: string,
       <label>Operator
         <input value={operator} onChange={(e) => setOperator(e.target.value)} onBlur={() => cmd("set_operator", { operator })} />
       </label>
-      <p className="instruction">{s?.instruction}{s && <><br /><b>Tower: {s.progress} / {s.levels} placed</b></>}</p>
+      <p className="instruction">{s?.instruction}{s && <><br /><b>Tower: {bricksPlaced(s.progress, s.in_area)} / {s.levels + 1} bricks placed</b></>}</p>
       <button className={`rec-btn ${rec}`} disabled={rec === "review" || !!s?.replay} onClick={() => cmd("record_toggle")}>
         <i />
         <span>{rec === "recording" ? `Stop · ${fmt(s!.elapsed)}` : rec === "countdown" ? `Starting in ${Math.ceil(s!.countdown)}…` : rec === "review" ? "Review take" : "Start recording"}</span>

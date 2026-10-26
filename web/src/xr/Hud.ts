@@ -1,5 +1,6 @@
 // World-anchored heads-up display above the far edge of the table.
 
+import { bricksPlaced } from "../goal";
 import type { Status } from "../protocol";
 import { SRC_CONTROLLER, SRC_HAND } from "../protocol";
 import { glass, Panel, roundRect, text, THEME, wrapText } from "./Panel";
@@ -72,7 +73,7 @@ export class Hud {
 
     // --- task + instruction ---------------------------------------------------------
     const tx = px + pillW + 40;
-    text(g, `${s.task.replace(/_/g, " ").toUpperCase()}  ·  ${s.progress}/${s.levels}`, tx, py + 26, 34, { weight: 800, color: THEME.text });
+    text(g, `${s.task.replace(/_/g, " ").toUpperCase()}  ·  ${bricksPlaced(s.progress, s.in_area)}/${s.levels + 1}`, tx, py + 26, 34, { weight: 800, color: THEME.text });
     wrapText(g, s.instruction, tx, py + 74, w - tx - 290, 38, 29, THEME.dim, 3);
 
     // --- stats column -----------------------------------------------------------------

@@ -96,7 +96,22 @@ def tower_keys(env, ik) -> list[tuple]:
     return keys
 
 
-def demo_gif(cfg, path: Path | None, size=(560, 350), every=5) -> bool:
+def gif_palette(frames: list[Image.Image], colors: int = 160) -> Image.Image:
+    """Palette from frames across the whole clip plus each brick colour from shadow to highlight: the bricks
+    cover a few hundred pixels, so a palette from the frames alone renders them grey."""
+    w, h = frames[0].size
+    picks = frames[:: max(1, len(frames) // 6)][:6]
+    shades = np.linspace(0.25, 1.15, 24)
+    swatch = np.array([[np.clip(np.array(b.rgba[:3]) * s, 0, 1) for s in shades] for b in BRICKS])
+    swatch = Image.fromarray((swatch * 255).astype(np.uint8)).resize((w, h // 2), Image.Resampling.NEAREST)
+    src = Image.new("RGB", (w, h * len(picks) + swatch.height))
+    for i, f in enumerate(picks):
+        src.paste(f, (0, i * h))
+    src.paste(swatch, (0, h * len(picks)))
+    return src.quantize(colors=colors)
+
+
+def demo_gif(cfg, path: Path | None, size=(640, 400), every=5) -> bool:
     env = BimanualEnv(cfg)
     env.reset(0)
     th = env.table_height
@@ -137,7 +152,7 @@ def demo_gif(cfg, path: Path | None, size=(560, 350), every=5) -> bool:
     if renderer:
         renderer.close()
         # One shared palette + a static camera lets the GIF encoder store only what changed per frame.
-        palette = frames[len(frames) // 2].quantize(colors=128)
+        palette = gif_palette(frames)
         pal = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
         pal[0].save(path, save_all=True, append_images=pal[1:], duration=int(1000 * env.control_dt * every),
                     loop=0, optimize=True)

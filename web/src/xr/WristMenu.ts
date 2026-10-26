@@ -11,6 +11,8 @@ export interface MenuActions {
   exit: () => void;
   toggleSound: () => void;
   soundOn: () => boolean;
+  toggleHints: () => void;
+  hintsOn: () => boolean;
 }
 
 export class WristMenu {
@@ -77,8 +79,10 @@ export class WristMenu {
 
       button("reset", m, 690, col2, 80, () => "↺  New scene", () => cmd("reset"), { enabled: idle }),
       button("exit", m + col2 + gap, 690, col2, 80, () => "⏏  Exit XR", () => this.act.exit()),
-      button("sound", m, 786, CW - 2 * m, 80, () => (this.act.soundOn() ? "🔊  Sound on" : "🔇  Sound off"),
+      button("sound", m, 786, col2, 80, () => (this.act.soundOn() ? "🔊  Sound" : "🔇  Muted"),
         () => { this.act.toggleSound(); this.panel.invalidate(); }, { active: () => this.act.soundOn() }),
+      button("hints", m + col2 + gap, 786, col2, 80, () => "🏷  Button hints",
+        () => { this.act.toggleHints(); this.panel.invalidate(); }, { active: () => this.act.hintsOn() }),
     ];
   }
 

@@ -79,6 +79,12 @@ CLUTCH_SOLREF = [0.01, 1]  # slightly compliant lock, like flexing plastic
 # the contacts so the studs, not the weld, carry the press and any sideways load.
 RIGID_SOLREF = [0.004, 1]
 RIGID_SOLIMP = [0.99, 0.999, 0.0005, 0.5, 2]
+# Collision bits: everything collides on bit 0; bit 1 links robot geoms to the brick cores only. A core is an
+# invisible solid box filling a brick's hollow underside that only the robot hits: pushed hard, a finger
+# could otherwise tip a brick or go through a thin wall into the cavity and stay hooked there with the gripper
+# open. Bricks still meet each other (studs, sockets, clutch) with the hollow shape.
+ROBOT_CONTYPE = 0b11
+CORE_CONAFFINITY = 0b10
 
 
 class Brick(NamedTuple):
@@ -183,6 +189,12 @@ def _add_task(spec: mujoco.MjSpec, th: float) -> None:
         _add_brick_geoms(body, b, material=f"{b.name}_mat", density=density, condim=4,
                          friction=[BRICK_FRICTION, 0.005, 0.0001], solref=RIGID_SOLREF, solimp=RIGID_SOLIMP,
                          priority=1)
+        hx, hy = b.half
+        hz = (b.h - TOP_T) / 2
+        body.add_geom(name=f"{b.name}_core", type=BOX, size=[hx - WALL_T, hy - WALL_T, hz], pos=[0, 0, hz],
+                      density=0, group=3, rgba=[0, 0, 0, 0], contype=0, conaffinity=CORE_CONAFFINITY, condim=4,
+                      friction=[BRICK_FRICTION, 0.005, 0.0001], solref=RIGID_SOLREF, solimp=RIGID_SOLIMP,
+                      priority=1)
     # One (initially off) weld per brick pair; its relative pose is set when the pair clicks together.
     for i, j in CLUTCH_PAIRS:
         spec.add_equality(name=f"clutch_{i}_{j}", type=mujoco.mjtEq.mjEQ_WELD, objtype=mujoco.mjtObj.mjOBJ_BODY,
@@ -432,9 +444,18 @@ def _add_arm(spec: mujoco.MjSpec, arm: str, cfg: SimConfig) -> None:
     for g in panda.geoms:
         if g.contype:
             g.solref, g.solimp = RIGID_SOLREF, RIGID_SOLIMP
+            g.contype = ROBOT_CONTYPE
     # Grippy finger pads; priority 2 so their friction/stiffness win over the (slippery) bricks.
+    # Menagerie's fingertip is a big pad plus four small boxes standing 1.5 mm proud of it with 4-5 mm slots in
+    # between; a stud or brick wall pressed into such a slot gets clamped by opposing contacts and the brick
+    # stays on the open finger. One flat box over the same area (same inner face, so grasp width is unchanged).
     for f in ("left_finger", "right_finger"):
         for g in panda.body(f).geoms:
+            if g.classname.name == "fingertip_pad_collision_1":
+                g.size, g.pos = [0.0085, 0.00475, 0.0085], [0, 0.00475, 0.0445]
+            elif g.classname.name.startswith("fingertip_pad_collision"):
+                panda.delete(g)
+                continue
             if g.contype:
                 g.friction = [1.5, 0.01, 0.001]
                 g.condim, g.priority, g.solref = 4, 2, [0.004, 1]

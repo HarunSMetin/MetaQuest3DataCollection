@@ -27,17 +27,24 @@ await xr.evaluate(() => {
   const d = window.__xr;
   d.position.set(0, 1.6, 0);
   d.quaternion.set(-0.2164, 0, 0, 0.9763); // look ~25° down at the table
-  d.controllers.left.position.set(-0.22, 1.25, -0.35);
-  d.controllers.right.position.set(0.22, 1.15, -0.4);
+  d.controllers.left.position.set(-0.2, 1.3, -0.4);
+  d.controllers.right.position.set(0.2, 1.3, -0.4);
 });
 await xr.click("#enter-vr");
-await sleep(3000); // auto-recenter runs 1.2 s after entering
-await xr.evaluate(() => window.__xr.controllers.right.updateButtonValue("squeeze", 1)); // engage (toggle): grasp-point marker brightens
-await xr.evaluate(() => window.__xr.controllers.left.updateButtonValue("y-button", 1)); // wrist menu
-await sleep(300);
-await xr.evaluate(() => window.__xr.controllers.left.updateButtonValue("y-button", 0));
+await sleep(6000); // auto-recenter runs 1.2 s after entering; controller models load
+// Software GL sends input at only a few Hz, so hold each button long enough for the server to see it.
+const press = async (side, button) => {
+  await xr.evaluate(([s, b]) => window.__xr.controllers[s].updateButtonValue(b, 1), [side, button]);
+  await sleep(1500);
+  await xr.evaluate(([s, b]) => window.__xr.controllers[s].updateButtonValue(b, 0), [side, button]);
+};
+await press("right", "squeeze"); // take control of the right arm: glow, status chip, brighter grasp-point marker
 await sleep(4000);
 await xr.screenshot({ path: `${OUT}/xr_headset.png` });
+
+await press("left", "y-button"); // wrist menu
+await sleep(1500);
+await xr.screenshot({ path: `${OUT}/xr_menu.png` });
 
 await browser.close();
 console.log(`screenshots written to ${OUT}`);

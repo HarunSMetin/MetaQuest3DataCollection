@@ -13,6 +13,11 @@ export function levelStates(task: TaskSpec, progress: number, inArea: boolean): 
   return placed.map((p, k) => (p ? "placed" : k === next ? "next" : "todo"));
 }
 
+/** Bricks placed so far (the base counts once it is in the area), the same count as levelStates. */
+export function bricksPlaced(progress: number, inArea: boolean): number {
+  return inArea ? 1 + progress : 0;
+}
+
 type V3 = [number, number, number];
 const EL = 0.6, AZ = -0.65; // view: from above (34°) and from the operator's right
 const D: V3 = [Math.cos(EL) * Math.cos(AZ), Math.cos(EL) * Math.sin(AZ), -Math.sin(EL)]; // view direction

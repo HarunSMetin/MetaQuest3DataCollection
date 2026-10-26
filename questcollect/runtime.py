@@ -388,7 +388,7 @@ class Runtime:
         placed = range(self._progress + 1, progress + 1)  # a knocked-down level can fire again later
         for level in placed:
             self._pattern(self._last_holder[level], HAPTIC_PLACED, now, "placed")
-            self._toast(f"{BRICKS[level].label} placed ({level}/{LEVELS})", "success")
+            self._toast(f"{BRICKS[level].label} placed ({level + 1}/{len(BRICKS)})", "success")  # base = 1
         self._progress = progress
         for kind, _lower, upper in self.env.clutch_events:
             if kind == "lock" and upper not in placed:
