@@ -89,7 +89,7 @@ export class Panel {
   private dirty = true;
   private lastPress = 0;
 
-  constructor(readonly widthM: number, readonly heightM: number, readonly pxPerM = 1400,
+  constructor(public widthM: number, public heightM: number, readonly pxPerM = 1400,
     private background?: (g: CanvasRenderingContext2D, w: number, h: number) => void) {
     this.canvas.width = Math.round(widthM * pxPerM);
     this.canvas.height = Math.round(heightM * pxPerM);
@@ -106,6 +106,19 @@ export class Panel {
   }
 
   invalidate() { this.dirty = true; }
+
+  /** Change the panel's size (metres); the canvas and texture are reallocated at the same pixel density. */
+  resize(widthM: number, heightM: number) {
+    if (Math.abs(widthM - this.widthM) < 1e-6 && Math.abs(heightM - this.heightM) < 1e-6) return;
+    this.widthM = widthM;
+    this.heightM = heightM;
+    this.canvas.width = Math.round(widthM * this.pxPerM);
+    this.canvas.height = Math.round(heightM * this.pxPerM);
+    this.texture.dispose();  // the GPU texture has the old size: re-upload
+    this.mesh.geometry.dispose();
+    this.mesh.geometry = new THREE.PlaneGeometry(widthM, heightM);
+    this.dirty = true;
+  }
 
   redraw(force = false) {
     if (!this.dirty && !force) return;

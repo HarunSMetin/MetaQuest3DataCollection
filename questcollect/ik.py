@@ -39,6 +39,11 @@ class BimanualIK:
         }
         self.posture = mink.PostureTask(m, cost=cfg.posture_cost)
         self.tasks = [*self.frame_tasks.values(), self.posture]
+        if cfg.damping_cost:
+            # Prefer the smallest joint motion. Without it, the redundant joints (1+3, 5+7) of a strongly folded
+            # arm whip at the velocity limit while the hand barely moves; on the recorded human targets 0.1 cut
+            # those steps 144 -> 24 (with the bases at sim.arm_base_x), tracking error p99 ~1.5 mm.
+            self.tasks.append(mink.DampingTask(m, cost=cfg.damping_cost))
         vel = {f"{a}_{j}": cfg.max_joint_vel for a in ARMS for j in ARM_JOINTS}
         self.limits = [mink.ConfigurationLimit(m), mink.VelocityLimit(m, vel)]
         if cfg.avoid_arm_collisions:  # otherwise the arms collide in the physics, like real ones

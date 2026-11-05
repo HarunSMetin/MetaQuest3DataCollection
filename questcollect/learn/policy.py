@@ -42,9 +42,14 @@ class PolicyRunner:
         pcfg = PreTrainedConfig.from_pretrained(self.path)
         pcfg.device = device
         if temporal_ensemble is not None:  # ACT: query every step, average the overlapping chunks
+            if pcfg.type != "act":
+                raise ValueError(f"temporal ensembling is ACT only; this is a {pcfg.type} policy")
             pcfg.temporal_ensemble_coeff, pcfg.n_action_steps = temporal_ensemble, 1
         elif n_action_steps is not None:
-            pcfg.n_action_steps = min(n_action_steps, getattr(pcfg, "chunk_size", n_action_steps))
+            # longest usable chunk: ACT predicts chunk_size steps, diffusion horizon - n_obs_steps + 1 from now
+            longest = (pcfg.horizon - pcfg.n_obs_steps + 1 if pcfg.type == "diffusion"
+                       else getattr(pcfg, "chunk_size", n_action_steps))
+            pcfg.n_action_steps = min(n_action_steps, longest)
         self.policy = get_policy_class(pcfg.type).from_pretrained(self.path, config=pcfg).to(device).eval()
         self.pre, self.post = make_pre_post_processors(pcfg, pretrained_path=str(self.path),
                                                        preprocessor_overrides={"device_processor": {"device": device}})
@@ -78,10 +83,18 @@ class PolicyRunner:
             batch[f"observation.images.{cam}"] = torch.from_numpy(img).permute(2, 0, 1).float()[None] / 255.0
         return batch
 
+    def _chunk_pending(self) -> bool:
+        """Whether the next action comes from an already predicted chunk, so this step's observation is unused.
+        Diffusion with n_obs_steps > 1 stacks the last frames, so it needs every observation."""
+        if self.policy.config.type == "diffusion":
+            queues = self.policy._queues
+            return self.policy.config.n_obs_steps == 1 and queues is not None and len(queues["action"]) > 0
+        return bool(getattr(self.policy, "_action_queue", None))
+
     @torch.inference_mode()
     def raw_action(self, env: BimanualEnv) -> np.ndarray:
         """The policy's next action, in the dataset's action layout (FeatureSpec.names)."""
-        if getattr(self.policy, "_action_queue", None) and self._last_batch is not None:
+        if self._chunk_pending() and self._last_batch is not None:
             batch = self._last_batch  # still executing the last predicted chunk: no need to render the cameras
         else:
             batch = self._last_batch = self.pre(self.observation(env))

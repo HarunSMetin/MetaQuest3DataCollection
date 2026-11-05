@@ -176,6 +176,8 @@ Everything goes through the `qc` command (run it as `uv run qc …`; every comma
 | `qc inspect <file>` | show what is inside an episode file |
 | `qc replay <file>` | play an episode back in MuJoCo's viewer |
 | `qc audit` | quality report of every episode, and which ones training will use |
+| `qc retime` | experimental: overlap the arms' work in recorded takes (re-simulated, originals kept) |
+| `scripts/generate_set.py <out>` | experimental: new takes from the recorded ones in new brick layouts (re-simulated, checked) |
 | `qc export <name>` | turn the selected episodes into a LeRobot dataset |
 | `qc train <dataset>` | train a policy on a dataset (lerobot-train) |
 | `qc eval <run>` | test a trained policy in the simulator |
@@ -187,8 +189,9 @@ Everything goes through the `qc` command (run it as `uv run qc …`; every comma
 uv run qc serve                     # options: --mode hands · --config my.yaml · --no-https · --policy outputs/<run>
 ```
 
-Keep this terminal open and open **<http://localhost:8000/dashboard/>** on the PC. You should see both arms, the
-bricks, four camera images and the recorder. The terminal prints the addresses for the headset.
+Keep this terminal open and open **<http://localhost:8000/dashboard/>** on the PC. The **Record** tab shows both
+arms, the bricks, four camera images and the recorder, with a line telling you what to do next; the **Episodes** tab
+holds your saved takes. The terminal prints the addresses for the headset.
 
 ### 2. Connect the Quest 3
 
@@ -234,19 +237,38 @@ comfortable, take control again, and the arm carries on from where it was.
 | Throw the take away | **B** | wrist menu |
 | Open the wrist menu | **Y** | turn your **left palm** towards your face |
 | Re-place the table in front of you | **left stick click** | wrist menu |
+| Move a panel (arm released) | point at it, hold **Trigger**; stick ↑↓ nearer/farther, ←→ size | point at it, pinch **thumb + index** |
 
 **What you see in the headset:**
 
 - **Your controllers**, with a label next to every button saying what it does right now. A label lights up while
   you press it and dims when the action isn't available (e.g. *Save* before anything was recorded). A tag above
-  each controller shows whether it controls its arm, which brick it holds, *Out of reach* and *REC*. The controller
-  glows in its arm's colour while it controls the arm.
+  each controller shows whether it controls its arm, which brick it holds, *Out of reach*, *REC* and, with button
+  labels on, **NEXT: the brick this arm should take** (that brick glows). The controller glows in its arm's colour
+  while it controls the arm.
 - **The grasp point**: a small dot between each gripper's fingers, with a line down to the table to help you line
-  up a brick. It turns **red** when the arm can't reach where you're pointing; move back towards the robot.
-- **The status panel** above the far table edge: recorder state, the task, latency and input rate.
-- **The goal panel** to its left: the target tower and your progress.
+  up a brick. It turns **red** when the arm can't reach where you're pointing (move back towards the robot).
+- **The status panel** above the far table edge: recorder state, the task, latency and input rate; after a take,
+  whether training would use it (below).
+- **The goal panel** beside the table on your left: the target tower and your progress.
+- **Camera view** (wrist menu): each wrist camera's field of view on the hand and the patch of table it sees.
+- **Camera previews** (wrist menu) beside the table on your right: the left wrist, top and right wrist cameras as
+  the policy sees them (no shadows, recorded resolution); the low camera can be added.
 - **The wrist menu** (below): input mode; record, save as success, save as failure, discard; recenter; motion
-  scale (*Slower* / *Faster*); new scene; exit VR; sound on/off; button labels on/off.
+  scale (*Slower* / *Faster*); new scene; exit VR; sound on/off; button labels on/off; camera view; previews.
+  Its **⚙ Layout** page arranges the previews (*Vertical*, *Horizontal* or *Grid*, and which cameras), shows or
+  hides the status, goal and preview panels, locks them, and resets them to where they started.
+
+**Moving panels.** Release the arm (Grip / middle pinch), point at the status, goal or preview panel (it gets an
+outline in the hand's colour) and hold Trigger, or pinch thumb + index with hands. The panel follows your hand and
+turns to face you; while you hold it, the stick moves it nearer or farther (up/down) and makes it bigger or smaller
+(left/right). Panels stay where you put them relative to the table (recenter takes them along), also next time
+on the same headset. An engaged arm never grabs panels, so moving one can't move the robot.
+
+**Collision protection.** The arms can't hit each other or the table: every joint target, yours or a policy's,
+goes through the safety filter, which stops the arms 2 cm apart, links 1 cm and fingertips 5 mm above the table (so
+you never drag the fingers over the table while grasping; the pads still reach far enough down a brick). When it has to step in you hear the collision buzz. There is no grasp assist: line up grasps yourself, and
+when one goes wrong, fix it in the take (lift, re-centre, try again). Those corrections are what a policy needs.
 
 <p align="center"><img src="docs/media/xr_menu.png" alt="The wrist menu open next to the left controller" width="640"></p>
 
@@ -264,7 +286,7 @@ without looking. Sounds come from the side of the arm involved.
 | The base brick was set down inside the taped square | — | a soft chime |
 | A brick clicked into its correct spot on the tower | a strong **double** pulse | a two-note chime |
 | The tower is finished and standing | a long **triple** pulse in both hands | a rising arpeggio |
-| The arms hit each other / an arm touched the table | a short buzz | a low buzz / a thump |
+| The arms hit each other / an arm touched the table, or the safety filter stopped you | a short buzz | a low buzz / a thump |
 | The arm can't reach where you're pointing | a short buzz | a double beep |
 
 Vibration needs the controllers. Sound starts when you press *Enter VR* and can be muted in the wrist menu.
@@ -278,11 +300,17 @@ ready ──A──▶ 3 s countdown ──▶ recording ──A (or 1 s after s
                                                                           └──B──▶ discarded
 ```
 
-After you save or discard, the same four bricks start in new random places. **X** marks the take as a success if
+After you save or discard, the same four bricks start in the same arrangement, each moved a little (up to 4 cm and
+15° within its own spot): red (base) and yellow on your left for the left arm, blue and green on your right for the
+right arm, so the arms take turns and can work at the same time. In review, the status panel says whether
+training would use the take (the same rules as `qc audit`): how many seconds, arm-on-table and arm-arm contacts,
+idle share. Discard takes it would skip, or that show something you wouldn't want a robot to copy.
+
+**X** marks the take as a success if
 the tower was finished at some point during it; on the dashboard and in the wrist menu you can also save a take
 explicitly as a *success* or a *failure*.
 
-**On the dashboard:** `Space` record / stop · `S` save as success · `F` save as failure · `D` discard ·
+**On the dashboard (Record tab):** `Space` record / stop · `S` save as success · `F` save as failure · `D` discard ·
 `R` new scene · `C` recenter. Set the operator name in the Recorder card; it is stored in every episode.
 
 **Tips for good demonstrations:**
@@ -300,8 +328,17 @@ uv run qc inspect data/episodes/episode_000000.hdf5   # metadata and the shape o
 uv run qc replay  data/episodes/episode_000000.hdf5   # play it back in MuJoCo's viewer (--speed 2 for faster)
 ```
 
-The dashboard's **Dataset** card lists all episodes: ▶ replays one in the scene (also shown in the headset), 🗑
-deletes it.
+The dashboard's **Episodes** tab lists all episodes (search by number, tag or note; filter by success or training
+use). Selecting one loads it into the scene as a paused replay (also shown in the headset) with a timeline that
+marks when each brick clicked in (click a mark to jump there). Play at 0.25× to 4× and loop if you like:
+`Space` play/pause, `←`/`→` ±1 s (`Shift` ±5 s), `,`/`.` one frame, `[`/`]` slower/faster, `↑`/`↓` previous/next
+episode.
+For the selected episode you can change its success label, exclude it from training, add tags and a note, or delete
+it. Labels go to `data/episodes/curation.json`; the episode files themselves are never changed.
+The **Dataset** menu at the top switches to any other episode folder under `data/` (retimed or generated takes,
+training mixes, eval rollouts) to replay and label it the same way. Each episode there shows which file it was made
+from; deleting is only possible in the recording folder. A folder can carry a `dataset.json`
+(`{"title": ..., "description": ...}`) for the name and text shown in the menu.
 
 ### 5. Train and evaluate a policy
 
@@ -332,16 +369,43 @@ uv run qc audit --exclude episode_000012.hdf5 --note "clumsy"  # leave one out b
 ```
 
 ```text
-episode_000001.hdf5     118.5s   2.3%  0.0%   2.0%   7%   39.5  68.2 103.7   ✗ arm link on the table 2.3% of the time (limit 1.0%)
+episode_000001.hdf5     118.5s   2.3%  0.0%   2.0%   7%   39.5  68.2 103.7   ✓ 115 s used
 episode_000006.hdf5      44.9s   0.0%  0.0%  45.0%   4%   19.2  21.3  43.8   ✗ hand dragging on the table 45.0% of the time (limit 30.0%)
 episode_000086.hdf5      51.5s   0.0%  0.0%   1.5%   7%   18.9  38.0  49.4   ✓ 51 s used
 
-78 of 87 episodes used: 83.8 of 94.8 min (78 segments).
+84 of 87 episodes used: 90.6 of 94.8 min (95 segments).
 ```
 
-The rules (contact limits, trimming the still start and end of each take, failed takes) are the `curate`
-section of [config.yaml](config.yaml). The dashboard's Dataset card shows the same verdict per episode (⚠ / ✓)
-and can exclude an episode (⊘). Your episode files are never changed.
+The rules are the `curate` section of [config.yaml](config.yaml): moments where an arm link rests on the table
+or the arms touch are cut out (with 0.2 s either side; the arm is blocked there, so its commands are not worth
+copying) and the rest of the take is kept as separate pieces; takes where the hand drags along the table too much
+are left out; the still start and end of each take are trimmed; failed takes are skipped. The dashboard's Episodes tab shows the same verdict per episode
+(*skipped* / *excluded*) and can exclude one, or relabel a take as a success or failure (training uses the label).
+Your episode files are never changed.
+
+**Optional, experimental: retime.** With one operator, one arm often waits while the other works, and a policy
+learns to wait too. `qc retime` reschedules a take so both arms work at once: each move of an arm (never cut in
+half) starts as soon as the other arm is out of the way. Only one arm at a time works at the tower, in the
+recorded order; the arms stay 2 cm and the wrist cameras 4 cm from the other arm (or as close as your take came,
+never closer), so a wrist camera never films the inside of the other arm. The take is then re-simulated, each
+brick placed where the tower really is, and kept only if the tower gets built with no new contacts. Typical
+result: about 25% shorter, both arms moving at once about 30% of the time. The results go to a separate folder
+(your episodes are not changed); export them like any other folder:
+
+```bash
+uv run qc retime                                   # all episodes -> data/episodes_retimed (about half a minute each)
+uv run qc audit --raw data/episodes_retimed && uv run qc export v1r --raw data/episodes_retimed
+```
+
+**Optional, experimental: generate.** `scripts/generate_set.py` makes new takes from yours: bricks start
+elsewhere (options widen the spawn area, turn the tower, shift the base, start the arms elsewhere), your hand
+motions follow the bricks, and every take is re-simulated and kept only if it passes the same checks. Run
+`qc retime` on the result to overlap the arms there too.
+
+```bash
+uv run python scripts/generate_set.py data/episodes_generated --per 10   # 10 kept takes per recorded one
+uv run qc retime data/episodes_generated/episode_*.hdf5 --out data/episodes_generated_retimed
+```
 
 **2. Export a dataset.** Renders the cameras from the recorded states, in the scene each episode was recorded in:
 
@@ -351,7 +415,8 @@ uv run qc export v1b --randomize-visuals  # vary lights, colours and camera moun
 ```
 
 What the policy sees and outputs is the `learn` section of the config: by default `cam_high` and both wrist
-cameras at 240×320, plus joint angles and gripper openings, and joint targets as actions (the ACT recipe). Each
+cameras at 240×320 (rendered without shadows), plus joint angles, gripper openings and joint velocities, and
+joint targets as actions (the ACT recipe). Each
 dataset stores these settings in its `questcollect_manifest.json`, together with exactly which episodes and
 steps went in.
 
@@ -365,17 +430,28 @@ uv run qc train v1 --steps=200000         # any extra --key=value goes to lerobo
 
 The `act_240` preset is [ACT](https://tonyzhaozh.github.io/aloha/) (action chunks of 100 steps = 2 s) sized for a
 6 GB laptop GPU (RTX 4050): batch 16, mixed precision, ~3.6 GB of GPU memory, ~8 hours for 100k steps.
+`--preset dp_240` is [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) (CNN U-Net, 64-step horizon,
+re-planned every 16 steps, DDIM): batch 32, ~5.1 GB, ~9.5 hours for 80k steps. Why these settings, and the
+results so far: [experiments/diffusion/README.md](experiments/diffusion/README.md).
 
 **4. Evaluate.** Runs the policy in the simulator on 50 fixed scenes it never saw, as fast as the PC allows:
 
 ```bash
 uv run qc eval outputs/<run>                  # last checkpoint, 50 rollouts
 uv run qc eval outputs/<run> --ensemble 0.01  # ACT temporal ensembling (smoother, slower)
+uv run qc eval outputs/<run> --n-action-steps 8  # re-plan more often (diffusion; ACT too)
 ```
 
 It prints the success rate and how far the tower got (base in the square, levels 1–3), the contacts, and how
 much the safety filter had to correct. Every rollout is saved as a normal episode file (`qc replay` it to watch a
 failure); the numbers go to `outputs/<run>/eval/<time>/metrics.json`.
+
+**Overnight: train + evaluate in one go.** `scripts/train_and_eval.sh v1` starts `qc train`, then `qc eval`
+(plain, then with `--ensemble 0.01` for ACT or half the `n_action_steps` for other policies) in the background, keeps the laptop awake (also with the lid closed) and
+writes `outputs/<run>/RESULTS.txt`; follow it with `tail -f outputs/latest.log`. Optional arguments: preset and
+number of rollouts (`scripts/train_and_eval.sh v1 dp_240 50`). To pause: `pkill -f train_and_eval.sh; pkill -f lerobot-train`;
+to continue from the last saved checkpoint (every 20k steps) and evaluate at the end:
+`scripts/train_and_eval.sh --resume outputs/<run>`.
 
 **5. Watch it, and correct it (DAgger).** Let the policy drive in the headset:
 
@@ -395,8 +471,8 @@ Teleoperation card switches between *You drive*, *Shared* and *Policy*.
 | Layer | What it does |
 | --- | --- |
 | Clean data | `qc audit` leaves out takes where an arm rested on the table, the arms touched, or the hand dragged along the table. |
-| Recovery data | DAgger corrections (above), and optionally `record.action_noise` (DART): small noise on what is executed while you record, so the data shows how you recover. |
-| Safety filter | Every policy action passes [questcollect/safety.py](questcollect/safety.py): it changes the joint targets as little as possible so the arms stay ≥ 2 cm apart and 1 cm above the table (fingertips may touch it). |
+| Recovery data | DAgger corrections (above), and `record.action_noise` (DART, on by default): while you record, the arm you are moving drifts a few mm off what you command, slowly, and you correct it without thinking; the data shows the correction. A released arm stays still. |
+| Safety filter | Every action, the operator's and a policy's, passes [questcollect/safety.py](questcollect/safety.py): it changes the joint targets as little as possible so the arms stay ≥ 2 cm apart, links 1 cm and fingertips 5 mm above the table. |
 
 ## What gets recorded
 
@@ -409,6 +485,7 @@ docstring at the top of [questcollect/recorder.py](questcollect/recorder.py).
 | `obs/gripper_width` | (T, 2) | finger opening in metres (0 to 0.08) |
 | `obs/ee_pose_left`, `obs/ee_pose_right` | (T, 7) | gripper pose: position + quaternion (w x y z), world frame |
 | `obs/objects` | (T, 4, 7) | the four brick poses (bottom centre of each brick) |
+| `obs/ee_wrench` | (T, 2, 6) | external force (N) and torque (Nm, about the gripper point) on each hand, world axes: what a real Franka estimates (`O_F_ext_hat_K`). A carried brick's weight, pressing one on (50–100 N before it clicks), bumps. Since v7; export computes it for older files |
 | `action/joint_pos` | (T, 16) | **[7 left joints, left gripper, 7 right joints, right gripper]**, the ALOHA/ACT layout; gripper 0 = closed, 1 = open |
 | `action/ee_pose` | (T, 16) | where the grippers were sent: left pose, right pose, two gripper values |
 | `sim/state` | (T, 407) | the complete simulator state before each step, including which bricks are clicked together |
@@ -417,7 +494,7 @@ docstring at the top of [questcollect/recorder.py](questcollect/recorder.py).
 | `clutch` | (T, 6) | which of the 6 brick pairs are clicked together |
 | `contacts` | (T, 3) | an arm link on the table, the two arms touching, a hand or fingertip on the table |
 | `control/source` | (T,) | who drove this step: 0 you, 1 a policy (shared-control takes) |
-| `teleop/*` | | head pose; per hand the raw controller pose and buttons or 25 hand-joint poses, pinch distances; engaged / tracked flags; latency |
+| `teleop/*` | | head pose; per hand the raw controller pose and buttons or 25 hand-joint poses, pinch distances; engaged / tracked flags; latency (v6 files also have the old grasp assist state) |
 | `time`, `wall_time` | (T,) | simulation time and PC clock |
 | *file attributes* | | task, instruction, operator, input mode, source (teleop / policy / shared), success, random seed, date, duration, the full scene (MJCF) and its fingerprint, the config, camera names, and the tower definition |
 
@@ -433,7 +510,8 @@ docstring at the top of [questcollect/recorder.py](questcollect/recorder.py).
                   green 1x2x2 on top. Press each brick down until it clicks.
        num_steps: 2577
          objects: ['red_2x4', 'blue_2x3', 'yellow_2x2', 'green_1x2x2']
-  schema_version: 4   (files recorded now are version 5: + contacts, control/source)
+  schema_version: 4   (files recorded now are version 7: v5 + contacts, control/source; v6 + teleop/assist; v7 without it, actions
+  safety-filtered)
          success: True
             task: build_tower
              ...
@@ -465,8 +543,8 @@ names, so existing ACT configs work as they are:
 
 | Feature | Shape | Contents |
 | --- | --- | --- |
-| `observation.state` | (16,) | joint angles + gripper openings (or gripper poses with `learn.action: ee`) |
-| `action` | (16,) | `action/joint_pos` (or `action/ee_pose`) |
+| `observation.state` | (42,) | joint angles + gripper openings (with `learn.action: ee`: gripper positions + 6D rotations and openings), then the 14 joint velocities (`learn.joint_vel`), then the 12 hand force/torque values, log-compressed: sign · log(1 + \|f\| / 1 N), torques / 0.1 Nm (`learn.ee_wrench`). Older datasets have fewer |
+| `action` | (16,) | `action/joint_pos`, by default with the arm targets as actually sent (`learn.action_label: executed`: the DART drift included, read from `sim/state`; `recorded` uses the operator's target before the drift, which near a click is ~2 mm off where the brick was seated) (with `learn.action: ee`: `action/ee_pose` as position + 6D rotation per arm and the grippers, (20,); the rotation is the first two columns of the rotation matrix, since the down-pointing gripper's quaternion flips sign between steps) |
 | `observation.images.<camera>` | (H, W, 3) | one video per camera in `learn.cameras`, re-rendered from `sim/state` |
 | `observation.environment_state` | (28,) | the four brick poses, only with `learn.env_state: true` (simulation only; a real robot doesn't have these) |
 | `task` | text | the instruction, used as the language prompt |
@@ -524,13 +602,14 @@ questcollect/              the Python package, one module per stage of the pipel
   protocol.py              binary message format between headset and server (mirrored in web/src/protocol.ts)
   scene_export.py          sends the scene's shapes and meshes to the browser so it can draw them
   audit.py                 episode quality report (contacts, idle time) and which steps training uses
-  safety.py                safety filter on policy actions: arms apart, off the table
+  safety.py                safety filter on every action: arms apart, off the table
   learn/                   policy learning; the only code that uses PyTorch / LeRobot (`uv sync --extra learn`)
     features.py            what a policy sees and outputs (shared by export and the policy runner)
     export.py              selected episodes → LeRobot dataset (re-renders the cameras) + manifest
     train.py               presets → lerobot-train runs in outputs/<run>/
     policy.py              runs a trained policy on the simulated arms
     evaluate.py            `qc eval`: rollouts on held-out scenes, success and stage metrics
+experiments/               experiment notes: what was tried, why, results, open ideas (README.md is the index)
 web/                       the browser side (TypeScript, three.js, React), built into web/dist/
   xr/index.html            the headset page    → code in src/xr/        (WebXR app, panels, controllers, sounds)
   dashboard/index.html     the PC dashboard    → code in src/dashboard/ (React)
@@ -563,6 +642,7 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | `sim.physics_dt` | 0.002 | physics step (500 Hz) |
 | `sim.control_hz` | 50 | control and recording rate |
 | `sim.table_height`, `sim.arm_spacing` | 0.75, 0.6 | table height and distance between the arm bases (m) |
+| `sim.arm_base_x` | −0.05 | arm base position along the table (m); 0 before 2026-11-03, which old episodes keep |
 | `sim.gripper_force` | 40 | squeeze force on a grasped object (N; the real Franka Hand does up to 70) |
 | `teleop.mode` | `controllers` | `controllers` or `hands` (also switchable in the headset and on the dashboard) |
 | `teleop.scale` | 1.0 | hand motion → gripper motion (the wrist menu's *Slower* / *Faster*) |
@@ -572,19 +652,20 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | `ik.position_cost`, `orientation_cost`, `posture_cost` | 1.0, 0.6, 0.01 | IK weights |
 | `ik.max_joint_vel` | 2.5 | joint speed limit (rad/s) |
 | `ik.max_lead` | 0.15 | how far (rad) the IK may run ahead of a blocked arm |
+| `ik.damping_cost` | 0.1 | prefer small joint motions (stops a folded arm spinning its joints while the hand barely moves) |
 | `ik.avoid_arm_collisions`, `collision_margin` | false, 0.03 | let the IK steer the arms around each other instead of letting them collide |
 | `ik.iterations` | 2 | IK solver iterations per control step |
 | `record.out_dir` | `data/episodes` | where episodes are saved |
 | `record.countdown_s` | 3 | countdown before recording starts (s) |
 | `record.cameras` | the four cameras | camera previews on the dashboard |
 | `record.operator` | `operator` | default operator name stored in episodes |
-| `record.action_noise` | 0 | DART: rad of noise on the executed joint targets while recording (the clean target is recorded) |
+| `record.action_noise` | 0.003 | DART: a slow drift (rad, std; ~3.5 mm at the gripper) on the executed joint targets while you record; the clean target is recorded. 0 = off |
 | `server.host`, `port`, `https_port`, `cert_dir` | 0.0.0.0, 8000, 8443, `certs` | network address, ports and certificate folder |
-| `curate.*` | | which episodes and steps training uses: contact limits, `trim_idle`, `include_failures`, `dagger_frames` |
-| `learn.cameras`, `image_size`, `action`, `env_state` | 3 cameras, 240×320, joint, false | what a policy sees and outputs |
+| `curate.*` | | which episodes and steps training uses: contact limits, `cut_contacts` + `contact_margin_s` (arm-on-table or arm-arm moments are cut out, the rest of the take is kept), `trim_idle`, `include_failures`, `dagger_frames` |
+| `learn.cameras`, `image_size`, `action`, `env_state`, `joint_vel`, `ee_wrench`, `action_label` | 3 cameras, 240×320, joint, false, true, true, executed | what a policy sees and outputs; `action_label`: train on the targets actually sent (`executed`, DART drift included) or the operator's before the drift (`recorded`) |
 | `learn.datasets_dir`, `runs_dir` | `data/lerobot`, `outputs` | where datasets and training runs go |
-| `learn.presets` | `act_240` | named lerobot-train settings for `qc train --preset` |
-| `safety.enabled`, `arm_margin`, `table_margin` | true, 0.02, 0.01 | the safety filter on policy actions (m) |
+| `learn.presets` | `act_240`, `dp_240` | named lerobot-train settings for `qc train --preset` |
+| `safety.enabled`, `arm_margin`, `table_margin`, `finger_table_margin` | true, 0.02, 0.01, 0.005 | the safety filter on every action, teleop and policy: distances it keeps between the arms, arm links and the table, fingertips and the table (m) |
 | `control.mode`, `policy`, `n_action_steps` | teleop, none, 10 | who drives in `qc serve`, and how often a live policy is asked |
 
 **The task** is defined by constants at the top of [questcollect/sim.py](questcollect/sim.py): the bricks

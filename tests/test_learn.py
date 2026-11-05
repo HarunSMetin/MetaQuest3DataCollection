@@ -71,7 +71,7 @@ def test_export_train_eval(cfg, tmp_path):
     ds = LeRobotDataset("local/tiny", root=out)
     assert ds.num_episodes == 2 and ds.num_frames == 120
     item = ds[0]
-    assert item["observation.state"].shape == (16,) and item["action"].shape == (16,)
+    assert item["observation.state"].shape == (42,) and item["action"].shape == (16,)  # state: + velocities, wrench
     assert item["observation.images.cam_high"].shape == (3, 48, 64)
     assert "observation.images.cam_low" not in item and "observation.environment_state" not in item
     _, data = read_episode(raw / "episode_000000.hdf5")

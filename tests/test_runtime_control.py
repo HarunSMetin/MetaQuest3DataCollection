@@ -80,3 +80,89 @@ def test_policy_modes_need_a_policy(rt):
     rt.policy = None
     rt._handle("set_control_mode", {"mode": "policy"}, 0.0)
     assert rt.control_mode == "teleop"
+
+
+def test_operator_drives_through_the_safety_filter(rt):
+    """Steering the left hand through the right arm: the safety filter stops it short instead of colliding."""
+    _ticks(rt, 5, _controllers(squeeze_left=1.0))  # Grip press engages the left arm
+    _ticks(rt, 5, _controllers())
+    assert rt._engaged["l"]
+    blocked = []
+    for k in range(150):
+        f = _controllers()
+        f.left.pose[0] = -0.2 + min(k, 100) * 0.006  # 0.6 m towards the right arm (XR +x = world -y) in 2 s
+        _ticks(rt, 1, f)
+        blocked.append(rt._safety_rad)
+        _, arms_touch, _ = rt.env.contact_flags()
+        assert not arms_touch
+    assert max(blocked) > 0.05  # it did have to step in
+
+
+def test_operator_fingers_stay_off_the_table(rt):
+    """Pushing the hand straight down past the table top: the fingers stop safety.finger_table_margin above it."""
+    import mujoco
+    m, d = rt.env.model, rt.env.data
+    fingers = [g for g in range(m.ngeom) if m.geom_contype[g] and m.body(m.geom_bodyid[g]).name.startswith("l_")
+               and m.body(m.geom_bodyid[g]).name.endswith("finger")]
+    table = m.geom("table_top").id
+    _ticks(rt, 5, _controllers(squeeze_left=1.0))
+    _ticks(rt, 5, _controllers())
+    gap = []
+    for k in range(200):
+        f = _controllers()
+        f.left.pose[1] = 1.1 - min(k, 120) * 0.006  # down 0.72 m: the target ends far below the table top
+        _ticks(rt, 1, f)
+        assert not rt.env.contact_flags()[2]
+        gap.append(min(mujoco.mj_geomDistance(m, d, g, table, 0.05, None) for g in fingers))
+    assert min(gap) > 0.5 * rt.cfg.safety.finger_table_margin
+    assert gap[-1] < 2 * rt.cfg.safety.finger_table_margin  # it did get down to the margin
+
+
+def test_review_summary(rt):
+    """After a take stops, status.review judges it with the curation rules."""
+    rt.cfg.record.countdown_s = 0
+    rt.command("record_toggle")
+    _ticks(rt, 80, _controllers())
+    assert rt.recorder.recording
+    rt.command("record_toggle")
+    _ticks(rt, 10, _controllers())
+    st = rt.status()
+    assert st["rec_state"] == "review"
+    review = st["review"]
+    assert review["duration_s"] == pytest.approx(len(rt.recorder.steps) / rt.cfg.sim.control_hz, abs=0.1)
+    assert review["rejected"] == "failed take" and review["used_s"] == 0  # the tower was not built
+    rt.command("discard")
+    _ticks(rt, 10)
+    assert rt.status()["review"] is None
+
+
+def test_replay_pause_seek_and_hold(rt, tmp_path):
+    """A replay can start paused, seek and resume; it holds the last frame; recording ends it."""
+    rt.cfg.record.countdown_s = 0
+    rt.recorder.out_dir = tmp_path
+    rt.command("record_toggle")
+    _ticks(rt, 30, _controllers())
+    rt.command("save", success=True)
+    _ticks(rt, 1)
+    rt.recorder.flush()
+    path = str(next(tmp_path.glob("episode_*.hdf5")))
+    rt.command("replay", path=path, paused=True, i=5)
+    _ticks(rt, 5)
+    assert rt.status()["replay"] == {"path": path, "i": 5, "n": 30, "paused": True, "speed": 1.0, "loop": False}
+    rt.command("replay_options", speed=0.5)
+    rt.command("replay_pause")
+    _ticks(rt, 4)
+    assert rt._replay["i"] == 7  # half speed: one recorded step every other tick
+    rt.command("replay_options", speed=2.0, loop=True)
+    _ticks(rt, 13)
+    assert rt._replay["i"] == 2 and not rt._replay["paused"]  # 7 + 2 * 11 = 29 (last), wraps to 0, then 2
+    rt.command("replay_options", speed=1.0, loop=False)
+    rt.command("replay_pause", paused=True)
+    _ticks(rt, 1)
+    rt.command("replay_seek", i=26)
+    rt.command("replay_pause")
+    _ticks(rt, 10)
+    assert rt.status()["replay"]["i"] == 29 and rt.status()["replay"]["paused"]  # held on the last frame
+    rt.command("record_toggle")
+    _ticks(rt, 2)
+    assert rt._replay is None and rt.recorder.recording

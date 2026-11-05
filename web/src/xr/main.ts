@@ -3,13 +3,19 @@
 import * as THREE from "three";
 import "./xr.css";
 import { Link } from "../net";
-import { B_SECONDARY, B_TRIGGER, fetchTask, InputPacker, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status } from "../protocol";
+import { levelStates } from "../goal";
+import {
+  B_SECONDARY, B_STICK_X, B_STICK_Y, B_TRIGGER, fetchTask, InputPacker, type ServerEvent, SRC_CONTROLLER, SRC_HAND, SRC_NONE,
+  type Status, type TaskSpec,
+} from "../protocol";
 import { ARM_COLORS, MujocoScene } from "../MujocoScene";
 import { type Side, XRInputSampler } from "./input";
+import { CamPreviewPanel } from "./CamPreviewPanel";
 import { GoalPanel } from "./GoalPanel";
 import { Hud } from "./Hud";
+import { PanelLayout } from "./Layout";
 import { Sounds } from "./sounds";
-import { WristMenu } from "./WristMenu";
+import { type PanelId, WristMenu } from "./WristMenu";
 import { HandViz, Pointer } from "./visuals";
 
 // ---------------------------------------------------------------------------------------------
@@ -53,24 +59,32 @@ camera.position.set(0.9, 1.75, 1.0);
 const mj = new MujocoScene({ shadows: true });
 scene.add(mj.root);
 
-// HUD lives in the MuJoCo world frame, above the far table edge, facing the operator.
+// World panels live in the MuJoCo world frame (so they follow the table on recenter). These are their default
+// poses; the operator can move them (layout).
+const layout = new PanelLayout();
+
+// HUD above the far table edge, facing the operator.
 const hud = new Hud();
-hud.panel.mesh.matrixAutoUpdate = false;
-hud.panel.mesh.matrix
+mj.root.add(hud.panel.mesh);
+layout.add("hud", hud.panel, () => new THREE.Matrix4()
   .makeBasis(new THREE.Vector3(0, -1, 0), new THREE.Vector3(0, 0, 1), new THREE.Vector3(-1, 0, 0))
   .multiply(new THREE.Matrix4().makeRotationX(-0.18))
-  .setPosition(1.02, 0, 0.75 + 0.6);
-mj.root.add(hud.panel.mesh);
+  .setPosition(1.02, 0, 0.75 + 0.6));
 
-// Goal panel to the left of the HUD (operator's view), turned a little towards the operator.
+// Goal panel beside the table on the operator's left, low and near, facing the operator's head (where the
+// arms don't reach in front of it). MuJoCo frame: the operator stands at x = -0.5.
+const OPERATOR_HEAD = new THREE.Vector3(-0.5, 0, 1.6);
+function facingOperator(at: THREE.Vector3) {
+  return new THREE.Matrix4().lookAt(OPERATOR_HEAD, at, new THREE.Vector3(0, 0, 1)).setPosition(at);  // +z (the face) to the head
+}
 const goal = new GoalPanel();
-goal.panel.mesh.matrixAutoUpdate = false;
-goal.panel.mesh.matrix
-  .makeRotationZ(0.3)
-  .multiply(new THREE.Matrix4().makeBasis(new THREE.Vector3(0, -1, 0), new THREE.Vector3(0, 0, 1), new THREE.Vector3(-1, 0, 0)))
-  .multiply(new THREE.Matrix4().makeRotationX(-0.18))
-  .setPosition(0.98, 0.67, 0.75 + 0.6);
 mj.root.add(goal.panel.mesh);
+layout.add("goal", goal.panel, () => facingOperator(new THREE.Vector3(0.3, 0.92, 0.75 + 0.3)));
+
+// Camera previews: the mirror image on the right (menu: Previews), so neither covers the work area.
+const previews = new CamPreviewPanel();
+mj.root.add(previews.panel.mesh);
+layout.add("previews", previews.panel, () => facingOperator(new THREE.Vector3(0.3, -0.92, 0.75 + 0.42)));
 
 const sounds = new Sounds();
 
@@ -82,6 +96,27 @@ function setHints(on: boolean) {
   try { localStorage.setItem(HINTS_KEY, on ? "on" : "off"); } catch { /* storage unavailable */ }
 }
 try { if (localStorage.getItem(HINTS_KEY) === "off") setHints(false); } catch { /* storage unavailable */ }
+// Persisted view toggles (wrist menu).
+function stored(key: string, def: boolean): boolean {
+  try { const v = localStorage.getItem(key); return v === null ? def : v === "on"; } catch { return def; }
+}
+function store(key: string, on: boolean) {
+  try { localStorage.setItem(key, on ? "on" : "off"); } catch { /* storage unavailable */ }
+}
+const CAMVIZ_KEY = "qc.camviz", PREVIEW_KEY = "qc.preview", HUD_KEY = "qc.hud", GOAL_KEY = "qc.goal";
+let camViz = false;
+function setCamViz(on: boolean) { camViz = on; mj.setCameraViz(on); store(CAMVIZ_KEY, on); }
+function setPreview(on: boolean) { previews.setVisible(on); store(PREVIEW_KEY, on); }
+setCamViz(stored(CAMVIZ_KEY, true));
+setPreview(stored(PREVIEW_KEY, false));
+const panelMeshes: Record<PanelId, THREE.Object3D> = { hud: hud.panel.mesh, goal: goal.panel.mesh, previews: previews.panel.mesh };
+function setPanel(id: PanelId, on: boolean) {
+  if (id === "previews") { setPreview(on); return; }
+  panelMeshes[id].visible = on;
+  store(id === "hud" ? HUD_KEY : GOAL_KEY, on);
+}
+setPanel("hud", stored(HUD_KEY, true));
+setPanel("goal", stored(GOAL_KEY, true));
 const pointers: Record<Side, Pointer> = { left: new Pointer(ARM_COLORS.l), right: new Pointer(ARM_COLORS.r) };
 for (const s of ["left", "right"] as Side[]) scene.add(handViz[s].group, pointers[s].group);
 
@@ -89,7 +124,21 @@ for (const s of ["left", "right"] as Side[]) scene.add(handViz[s].group, pointer
 // Networking
 
 let status: Status | null = null;
+let task: TaskSpec | null = null;
 let lastServerT = 0;
+
+/** Data-collection guide: which brick comes next and which arm should take it (the one on its side of the
+ *  table, or the one holding it). The brick glows; that arm's status chip names it. Follows the hints toggle. */
+function updateGuide(s: Status) {
+  const k = task && handViz.left.showHints ? levelStates(task, s.progress, s.in_area).indexOf("next") : -1;
+  const b = task && k >= 0 ? task.bricks[task.goal[k].brick] : null;
+  const holder = b ? (["l", "r"] as const).find((a) => s.held[a] === b.name) : undefined;
+  const body = b ? mj.root.getObjectByName(b.name) : undefined;
+  const arm = holder ?? (body ? (body.position.y > 0 ? "l" : "r") : undefined);  // +y: the operator's left
+  mj.highlightBody(b && !holder ? b.name : null);
+  handViz.left.next = b && arm === "l" && !holder ? b.label : null;
+  handViz.right.next = b && arm === "r" && !holder ? b.label : null;
+}
 const packer = new InputPacker();
 
 const link = new Link("/ws/xr", {
@@ -101,6 +150,7 @@ const link = new Link("/ws/xr", {
     status = s;
     mj.setPlacement(s.placement);
     mj.setOutOfReach(s.out_of_reach);
+    updateGuide(s);
     hud.update(s);
     goal.update(s);
     menu.update(s);
@@ -119,7 +169,7 @@ const link = new Link("/ws/xr", {
     else if (e.type === "sound") sounds.play(e.name, e.arm);
   },
   // (Re)load the scene on every connect, so a restarted server with a changed scene is picked up.
-  onOpen: () => { mj.load(); fetchTask().then((t) => goal.setTask(t)).catch(() => {}); updateLanding(); },
+  onOpen: () => { mj.load(); fetchTask().then((t) => { task = t; goal.setTask(t); }).catch(() => {}); updateLanding(); },
   onClose: () => { status = null; handViz.left.setStatus(null); handViz.right.setStatus(null); updateLanding(); },
 });
 
@@ -133,14 +183,28 @@ const menu = new WristMenu({
   soundOn: () => sounds.enabled,
   toggleHints: () => setHints(!handViz.left.showHints),
   hintsOn: () => handViz.left.showHints,
+  toggleCamViz: () => setCamViz(!camViz),
+  camVizOn: () => camViz,
+  togglePanel: (id) => setPanel(id, !panelMeshes[id].visible),
+  panelOn: (id) => panelMeshes[id].visible,
+  previewLayout: () => previews.layout,
+  setPreviewLayout: (l) => previews.setLayout(l),
+  toggleCam: (name) => previews.toggleCam(name),
+  camOn: (name) => previews.camOn(name),
+  toggleLock: () => layout.toggleLock(),
+  locked: () => layout.locked,
+  resetLayout: () => layout.reset(),
 });
 scene.add(menu.panel.mesh);
 
 const raycaster = new THREE.Raycaster();
-const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3(), tmpV3 = new THREE.Vector3(), tmpQ = new THREE.Quaternion();
+const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3(), tmpV3 = new THREE.Vector3();
+const tmpQ = new THREE.Quaternion(), tmpQ2 = new THREE.Quaternion();
 const headPos = new THREE.Vector3();
 const UP_OFFSET = new THREE.Vector3(0, 0.13, 0);
-const prevTrigger: Record<Side, number> = { left: 0, right: 0 };
+const selecting: Record<Side, boolean> = { left: false, right: false };
+const sentGrip: Record<Side, { trigger: number; pinch: number }> = { left: { trigger: 0, pinch: 0.1 }, right: { trigger: 0, pinch: 0.1 } };
+let lastFrameMs = 0;
 let prevMenuBtn = 0;
 let menuToggled = false;
 let pokePrevZ = 1;
@@ -174,34 +238,67 @@ function placeMenu() {
   } else if (menu.visible) menu.setVisible(false);
 }
 
-function interact() {
+/** Select = Trigger (controllers) or thumb-index pinch (hands), with hysteresis. */
+function selectDown(side: Side): boolean {
+  const h = sampler.hands[side], was = selecting[side];
+  selecting[side] = h.source === SRC_CONTROLLER ? h.buttons[B_TRIGGER] > (was ? 0.5 : 0.7)
+    : h.source === SRC_HAND ? h.pinch[0] < (was ? 0.03 : 0.015) : false;
+  return selecting[side];
+}
+
+function interact(dt: number) {
   const uiCapture: Record<Side, boolean> = { left: false, right: false };
   let hovered: string | null = null;
+  const panelHover = new Map<THREE.Object3D, THREE.Color>();
 
   for (const side of ["left", "right"] as Side[]) {
     const h = sampler.hands[side];
     const ray = sampler.rays[side];
+    const wasDown = selecting[side], down = selectDown(side);
     pointers[side].hide();
-    if (h.source !== SRC_CONTROLLER || !ray || !menu.visible || side === "left") continue;
+    if (!ray || h.source === SRC_NONE) { layout.end(side); continue; }
+    // Panels can only be grabbed with a hand whose arm is released, so moving one never moves the robot.
+    const armFree = !mj.engaged[side === "left" ? "l" : "r"];
     const origin = tmpV.fromArray(ray.origin);
     const q = tmpQ.set(...ray.quat);
-    raycaster.set(origin, tmpV2.set(0, 0, -1).applyQuaternion(q));
-    const hit = raycaster.intersectObject(menu.panel.mesh, false)[0];
-    if (hit) {
+    const dir = tmpV2.set(0, 0, -1).applyQuaternion(q);
+
+    if (layout.dragging(side)) {
+      if (down && armFree) {
+        layout.drag(side, origin, dir, headPos, h.buttons[B_STICK_X], h.buttons[B_STICK_Y], dt);
+        pointers[side].set(origin, q, layout.dragPoint(side));
+        uiCapture[side] = true;
+        continue;
+      }
+      layout.end(side);
+    }
+
+    const menuRay = menu.visible && side === "right" && h.source === SRC_CONTROLLER;
+    const targets = armFree ? layout.targets() : [];
+    if (menuRay) targets.push(menu.panel.mesh);
+    if (!targets.length) continue;
+    raycaster.set(origin, dir);
+    const hit = raycaster.intersectObjects(targets, false)[0];
+    if (hit && hit.object === menu.panel.mesh) {
       uiCapture[side] = true;
       const local = menu.panel.mesh.worldToLocal(hit.point.clone());
       const w = menu.panel.widgetAt(local);
       hovered = w?.id ?? null;
       pointers[side].set(origin, q, hit.point, menu.panel.mesh.quaternion);
-      const trig = h.buttons[B_TRIGGER];
-      if (w && trig > 0.7 && prevTrigger[side] <= 0.7) {
-        if (menu.panel.press(w)) sampler.pulse(side, 0.4, 25);
+      if (w && down && !wasDown && menu.panel.press(w)) sampler.pulse(side, 0.4, 25);
+    } else if (hit) {
+      uiCapture[side] = true;
+      panelHover.set(hit.object, side === "left" ? ARM_COLORS.l : ARM_COLORS.r);
+      pointers[side].set(origin, q, hit.point, hit.object.getWorldQuaternion(tmpQ2));
+      if (down && !wasDown) {
+        layout.begin(side, hit.object, origin, hit.point);
+        sampler.pulse(side, 0.5, 30);
       }
-    } else {
+    } else if (menuRay) {
       pointers[side].set(origin, q, null);
     }
   }
-  for (const side of ["left", "right"] as Side[]) prevTrigger[side] = sampler.hands[side].buttons[B_TRIGGER];
+  layout.highlight(panelHover);
 
   // Poke with the right index fingertip (hand tracking).
   const right = sampler.hands.right;
@@ -217,9 +314,17 @@ function interact() {
   }
   menu.panel.setHover(hovered);
 
-  // Pointing at UI must not close the gripper.
+  // Pointing at UI must not move the gripper (holding what was sent before, so a held brick isn't dropped)
+  // or send the stick that is moving a panel.
   for (const side of ["left", "right"] as Side[]) {
-    if (uiCapture[side]) sampler.hands[side].buttons[B_TRIGGER] = 0;
+    const h = sampler.hands[side], last = sentGrip[side];
+    if (uiCapture[side]) {
+      h.buttons[B_TRIGGER] = last.trigger;
+      h.pinch[0] = last.pinch;
+      h.buttons[B_STICK_X] = h.buttons[B_STICK_Y] = 0;
+    }
+    last.trigger = h.buttons[B_TRIGGER];
+    last.pinch = h.pinch[0];
   }
 }
 
@@ -232,7 +337,8 @@ renderer.setAnimationLoop((_t, frame?: XRFrame) => {
     const ref = renderer.xr.getReferenceSpace()!;
     sampler.sample(frame, ref);
     placeMenu();
-    interact();
+    interact(Math.min((now - (lastFrameMs || now)) / 1000, 0.1));
+    lastFrameMs = now;
     link.sendBinary(packer.pack(sampler.head, sampler.hands.left, sampler.hands.right, lastServerT));
     tmpQ.fromArray(sampler.head, 3);
     handViz.left.update(sampler.hands.left, sampler.radii.left, mj.engaged.l, sampler.sources.left, tmpQ);
@@ -246,6 +352,7 @@ renderer.setAnimationLoop((_t, frame?: XRFrame) => {
   mj.update(now);
   hud.tick();
   goal.tick();
+  previews.tick();
   if (menu.visible) menu.panel.redraw();
   renderer.render(scene, camera);
 });
@@ -282,7 +389,7 @@ async function enterXR(mode: "vr" | "ar") {
     document.body.classList.remove("in-xr");
     setPassthrough(false);
     menu.setVisible(false);
-    for (const s of ["left", "right"] as Side[]) { pointers[s].hide(); handViz[s].group.visible = false; }
+    for (const s of ["left", "right"] as Side[]) { pointers[s].hide(); handViz[s].group.visible = false; layout.end(s); }
   });
   // Align the virtual workcell with where the operator is standing.
   setTimeout(() => link.command("recenter"), 1200);
@@ -329,4 +436,4 @@ initLanding();
 updateLanding();
 
 // Debug handle for automated tests and the browser console.
-(window as unknown as { __qc: unknown }).__qc = { sampler, mj, link, renderer, hud, goal, menu, sounds };
+(window as unknown as { __qc: unknown }).__qc = { sampler, mj, link, renderer, hud, goal, previews, menu, sounds, layout };

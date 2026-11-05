@@ -1,5 +1,6 @@
 import os
 
+import mujoco
 import numpy as np
 import pytest
 
@@ -9,7 +10,8 @@ from questcollect.recorder import Recorder, RecState, list_episodes, make_step, 
 from questcollect.runtime import HAPTIC_CLICK, HAPTIC_COMPLETE, HAPTIC_PLACED, HAPTIC_UNCLICK, Runtime
 from questcollect.scene_export import export_scene
 from questcollect.sim import (BRICK_H, BRICKS, BUILD_AREA_CENTER, BUILD_AREA_HALF, CLUTCH_PRESS_N, CLUTCH_PULL_N,
-                              HOME_Q, LEVELS, PITCH, BimanualEnv, set_brick_pose, task_spec, tower_poses)
+                              HOME_Q, LEVELS, PITCH, SPAWN, SPAWN_JITTER_M, SPAWN_YAW, BimanualEnv, set_brick_pose,
+                              task_spec, tower_poses)
 
 
 @pytest.fixture(scope="module")
@@ -92,6 +94,18 @@ def test_bricks_never_start_in_build_area(env):
             xy = env.data.body(b.name).xpos[:2]
             gap = np.maximum(np.abs(xy - BUILD_AREA_CENTER) - BUILD_AREA_HALF, 0)
             assert np.linalg.norm(gap) > 0.02, (seed, b.name)
+
+
+def test_bricks_spawn_in_their_regions(env):
+    """Same arrangement every episode: each brick within its own region, at a small yaw, on the arm's side."""
+    for seed in range(30):
+        env.reset(seed=seed)
+        for b in BRICKS:
+            body = env.data.body(b.name)
+            assert np.all(np.abs(body.xpos[:2] - SPAWN[b.name]) <= SPAWN_JITTER_M + 1e-9), (seed, b.name)
+            yaw = np.arctan2(body.xmat[3], body.xmat[0])
+            assert abs(yaw) <= SPAWN_YAW + 1e-9, (seed, b.name)
+    assert [np.sign(SPAWN[b.name][1]) for b in BRICKS] == [1, -1, 1, -1]  # build order alternates arms (left: y>0)
 
 
 def test_task_spec_describes_goal():
@@ -214,6 +228,11 @@ def test_grasp_detection_and_force(cfg, env):
     squeeze = -env.data.actuator_force[env.grip_act[0]] / 2  # each finger gets half the tendon force
     assert abs(squeeze - cfg.sim.gripper_force) < 1.0
     assert env.data.body(BRICKS[2].name).xpos[2] > th + 0.05, "brick should be lifted"
+    # The hand wrench: the squeeze cancels out, the carried brick's weight remains (pulling down), the idle hand
+    # feels nothing.
+    w = env.ee_wrench()
+    assert w[0, 2] == pytest.approx(-BRICKS[2].mass * 9.81, abs=0.03) and np.abs(w[0, :2]).max() < 0.05
+    assert not w[1].any()
 
 
 def test_fingers_move_at_franka_speed(env):
@@ -288,6 +307,9 @@ def test_scene_export(env):
         faces = np.frombuffer(blob, "<u4", m["nface"] * 3, m["faceOffset"])
         assert faces.max() < m["nvert"]
     assert len(blob) == scene["blobSize"]
+    cams = {c["name"]: c for c in scene["cameras"]}
+    assert {"cam_high", "cam_left_wrist", "cam_right_wrist"} <= set(cams)
+    assert scene["bodies"][cams["cam_left_wrist"]["body"]]["name"] == "l_hand" and cams["cam_left_wrist"]["fovy"] == 80
 
 
 def _fake_step(env, i):
@@ -366,3 +388,23 @@ def test_tower_haptics(cfg):
     assert HAPTIC_UNCLICK in pulses()
     sounds = [e["name"] for e in events if e["type"] == "sound"]
     assert "unclick" in sounds
+
+
+def test_executed_targets_and_tcp_poses_from_states(env):
+    """The targets sent each step come back out of the saved states (learn.action_label: executed)."""
+    env.reset(3)
+    rng = np.random.default_rng(0)
+    q0 = env.data.qpos[env.arm_qadr].copy()
+    states, sent = [], []
+    for _ in range(5):
+        q = q0 + rng.normal(0, 0.01, 14)
+        states.append(env.get_state())
+        env.apply_action(q, np.ones(2))
+        sent.append(q)
+        env.step()
+    ex = env.executed_targets(np.array(states))
+    np.testing.assert_allclose(ex[:-1], np.array(sent)[:4])  # state t+1 holds the target of step t
+    mujoco.mj_forward(env.model, env.data)  # site_xpos after mj_step is from before the last integration
+    tcp = env.tcp_poses_at(env.data.qpos[env.arm_qadr][None])[0]
+    for k, sid in enumerate(env.tcp_sites):
+        np.testing.assert_allclose(tcp[k, :3], env.data.site_xpos[sid], atol=1e-9)

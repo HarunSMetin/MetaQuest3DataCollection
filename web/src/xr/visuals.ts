@@ -126,13 +126,15 @@ class StatusChip {
     });
   }
 
-  refresh(s: Status | null, engaged: boolean) {
+  /** next: the brick this arm should take next (data-collection guide), or null. */
+  refresh(s: Status | null, engaged: boolean, next: string | null = null) {
     const a = this.arm;
     let detail = "Press GRIP to take control", dc = THEME.dim;
     if (!s) { detail = "Server offline"; dc = THEME.warn; }
     else if (s.mode === "hands") { detail = "Hands mode: put controllers down"; dc = THEME.warn; }
     else if (s.out_of_reach[a]) { detail = "⚠ Out of reach"; dc = THEME.rec; }
     else if (s.held[a]) { detail = `✊ ${s.held[a]!.replace(/_/g, " ")}`; dc = THEME.ok; }
+    else if (next) { detail = `NEXT: ${next}`; dc = this.color; }
     else if (engaged) { detail = "TRIGGER closes gripper"; dc = THEME.text; }
     if (s?.rec_state === "recording") detail = `● REC  ${detail}`;
     const title = engaged ? "ENGAGED" : "IDLE";
@@ -204,6 +206,9 @@ export class HandViz {
   }
 
   setStatus(s: Status | null) { this.status = s; }
+
+  /** The brick this arm should take next (shown on the status chip), or null. */
+  next: string | null = null;
 
   /** The model factory picks the left/right asset from the source's input profiles on "connected". */
   private setSource(src: XRInputSource | null) {
@@ -319,7 +324,7 @@ export class HandViz {
         }
         (this.leaders.material as THREE.LineBasicMaterial).opacity = engaged ? 0.3 : 0.7;
       }
-      this.chip.refresh(this.status, engaged);
+      this.chip.refresh(this.status, engaged, this.next);
       this.layoutUi(headQ);
     }
   }

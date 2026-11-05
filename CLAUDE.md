@@ -21,6 +21,8 @@ uv run qc doctor                        # environment checklist
 uv run qc serve [--mode hands] [--config my.yaml] [--no-https]
 uv run qc view | replay <ep.hdf5> | inspect <ep.hdf5>
 uv run qc audit [--exclude ep.hdf5 --note why]       # quality report; cache data/episodes/audit.json
+uv run qc retime [eps...] [--out data/episodes_retimed]  # experimental: overlap the arms' work, re-simulated
+uv run python scripts/generate_set.py data/episodes_generated  # experimental: new layouts from the recorded takes
 uv run qc export <name> [--randomize-visuals]          # -> data/lerobot/<name> (+ questcollect_manifest.json)
 uv run qc train <dataset> [--preset act_240] [--dry-run] [--key=value ...]   # -> outputs/<run>/train
 uv run qc eval outputs/<run> [--n 50] [--ensemble 0.01]   # -> outputs/<run>/eval/<time>/metrics.json
@@ -69,7 +71,12 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
 - **Goal UI is data-driven**: `sim.task_spec()` (bricks, goal placements relative to the base, area) is served at
   `GET /api/task`; `web/src/goal.ts` draws any such goal (isometric canvas) for the headset `xr/GoalPanel.ts` and the
   dashboard Goal card, using `status.progress`/`status.in_area`. Don't hard-code the tower in the client; there is
-  no reference tower in the scene.
+  no reference tower in the scene. Headset layout: goal panel beside the table on the operator's left, camera
+  previews (`xr/CamPreviewPanel.ts`, polls `/api/preview`) on the right, wrist-camera frustums/footprints from the
+  cameras in `/api/scene`; the next brick glows and its arm's status chip names it (menu toggles in localStorage).
+  Those are only the default poses: `xr/Layout.ts` (`PanelLayout`) lets the operator grab HUD/goal/previews with a
+  ray (Trigger / thumb-index pinch, only with a released arm) and persists poses in the `mj.root` frame; register new
+  world panels with `layout.add`. The wrist menu's Layout page sets the preview grid (column/row/grid, cameras).
 - **Clutch** (`BimanualEnv._update_clutch`, runs after every control step): one inactive weld per brick pair
   (`CLUTCH_PAIRS`); it switches on (at the bricks' current relative pose) when a pair touches, `stud_seated` finds the
   upper brick on the lower one's stud grid and the vertical contact force exceeds `CLUTCH_PRESS_N`, and off when
@@ -81,7 +88,9 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
 - **Gripper**: stiff tendon servo with `forcerange` = 2 × `sim.gripper_force` (each finger gets half the tendon force)
   and the target rate-limited to 50 mm/s per finger in `apply_action`, like the real Franka Hand. Elliptic friction
   cones + `impratio` 10.
-  `BimanualIK` compiles the same spec without the task (`build_spec(..., with_task=False)`). It is open-loop but
+  `BimanualIK` compiles the same spec without the task (`build_spec(..., with_task=False)`). Arm bases sit at
+  `sim.arm_base_x` (old episodes: 0, see `env_from_episode`) and the IK has a `DampingTask` (`ik.damping_cost`): both stop a folded arm whipping joints 1+3 / 5+7
+  at the velocity limit (measured on the human targets: 144 such steps -> 24). It is open-loop but
   `follow()` clamps it to `ik.max_lead` of the measured joints each tick, so a physically blocked arm doesn't wind
   up; arm-arm avoidance in the IK is off by default (`ik.avoid_arm_collisions`), the physics handles collisions.
   `scene_export.py` serializes visual geometry served at `/api/scene` + `/api/scene.bin`;
@@ -98,6 +107,13 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   `meta-quest-touch-plus`, the capsule is the fallback). Per-button callouts (`HINTS`, labels mirror
   `CONTROLLER_COMMANDS` in `teleop.py`; keep them in sync) are laid out in view space each frame, plus a status chip
   and an engaged/out-of-reach emissive glow.
+- **No grasp assist** (removed 2026-11-03): demos are the operator's own targets, so they show the imprecision
+  and corrections a policy meets. Instead the operator's IK output goes through the same `SafetyFilter` as policy
+  actions (arms apart, links 1 cm and fingertips `safety.finger_table_margin` 5 mm off the table; pass the measured
+  finger joints, frozen in its QP); the filtered joints are the recorded action
+  and `action/ee_pose` is their TCP pose (schema v7; v6 files still have `teleop/assist`). Bricks start in
+  fixed per-brick regions (`SPAWN`, alternating arms in build order). `CameraRenderer` (policy cameras: export,
+  eval, live) renders matte: no shadows, no specular light, no reflections.
 - **Teleop** (`teleop.py`): One-Euro filters, `ArmClutch` (relative motion, no jump on re-engage), controller (Grip
   press toggles the clutch) and hand (thumb-middle pinch toggles) mappers, and `Teleop` (stale-input disengage, jump rejection, workspace clamp, mode-mismatch detection).
   `frames.py` converts XR local-floor ↔ MuJoCo world and owns table placement/recenter.
@@ -105,11 +121,24 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   after success) plus HDF5 read/write; the file layout is documented in its module docstring. Images are never
   recorded: full `sim/state` per step lets the exporter re-render cameras at any resolution. `action/joint_pos` uses
   the ALOHA/ACT layout `[7 left, left grip, 7 right, right grip]`, grip 0 = closed, 1 = open.
-- **One definition per concept**: contacts = `BimanualEnv.contact_flags` (warnings, recording, audit, eval); a
+- **One definition per concept**: contacts = `BimanualEnv.contact_flags` (warnings, recording, audit, eval); arm
+  and wrist-camera clearance = `sim.ArmClearance` (generation, retime); a
   recorded step = `recorder.make_step`, file attrs = `recorder.episode_meta` (live recorder and eval rollouts);
   policy obs/action layout = `learn/features.FeatureSpec` (export and `PolicyRunner`; stored in each dataset
-  manifest); episode selection = `audit.verdict`/`select` (`curate` config + `curation.json`). Schema v5 adds
+  manifest; `joint_vel` adds velocities, `ee_wrench` the hand force/torque to the state; `action_label: executed` labels with the DART-drifted targets actually sent, from `sim/state` via `BimanualEnv.executed_targets`); hand wrench =
+  `BimanualEnv.ee_wrench` (recorded as `obs/ee_wrench`); episode selection = `audit.verdict`/`select`/`kept_spans`
+  (`curate` config + `curation.json`; also the headset's review verdict via `audit_arrays`). Manual labels
+  (exclude, note, tags, success override = `labelled_success`) only ever go to `curation.json` through
+  `audit.update_curation`; episode files are never rewritten. Schema v5 adds
   `contacts` and `control/source`; `audit.py` replays `sim/state` for older files.
+- **Generation + retiming** (experimental; `generate.py`, `retime.py`, `scripts/generate_*.py`): `generate.replay`
+  plays a take's TCP targets through the IK, adapted: picks follow the brick, each brick is placed relative to the
+  brick it goes onto *as it is now* plus an in-hand correction (towers slide a few mm under the press, so replaying
+  recorded joints after any change misses), optionally new layouts / per-arm time maps. `generate.check` accepts a
+  take (tower built, no new contacts, `sim.ArmClearance`: arms `ARM_CLEAR_M` / wrist cameras `CAM_CLEAR_M` apart,
+  or as close as the source came). Retime schedules whole moves (never split mid-motion) as early as clearance, the
+  one-arm tower zone and gripper settle times allow, then replays and checks; failures delay moves and retry.
+  Recorded `action/joint_pos` still replays bit-exactly from `sim/state[0]` (`test_recorded_actions_replay_exactly`).
 - **Replaying recorded episodes**: use `sim.env_from_episode(meta)` (episode's own config + `scene_hash` check), not
   `BimanualEnv(load_config())`. `scene_hash` is computed from the saved MJCF via `load_recorded_model` (the compiled
   spec hashes differently by float noise). Re-renders match to within 1/255 (GPU shadow noise, also between runs).
@@ -118,7 +147,7 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   `lerobot-train` subprocess (`learn/train.py`, run layout `outputs/<run>/{questcollect_run.json,train,eval}`);
   `PolicyRunner` needs that run manifest to know the FeatureSpec. Eval seeds come from `EVAL_SEED_BASE`.
 - **Control modes** (`Runtime._who_drives`): teleop | policy | shared. Policy path = `PolicyRunner.act` →
-  `SafetyFilter.filter` (mink QP, 8 substeps: the linearized collision limits need them) → apply. While the policy
+  `SafetyFilter.filter` (the operator path = IK → the same filter) (mink QP, 8 substeps: the linearized collision limits need them) → apply. While the policy
   drives, `ik.reset(q)` + `Teleop.sync_hold` keep the operator side at the current pose so a Grip takeover never
   jumps. `record.action_noise` = DART noise on executed (not recorded) operator targets.
 - **Config**: runtime tunables live in `config.yaml` (incl. `curate`, `learn` + presets, `safety`, `control`),

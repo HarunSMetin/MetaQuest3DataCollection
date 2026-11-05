@@ -58,6 +58,9 @@ WALL_T = PITCH / 2 - STUD_R - PLAY - GAP  # walls hug the studs of the brick bel
 TUBE_R = PITCH / np.sqrt(2) - STUD_R - PLAY  # underside tubes touch the 4 surrounding studs
 BRICK_FRICTION = 0.5     # ABS on ABS: no published value; measure with a tilt test (tan of slip angle)
 OPERATOR_GROUP = 5       # geom group MuJoCo cameras don't render (they show 0-2): headset/dashboard only
+WRIST_CAM_POS = (0.1, 0.0, 0.0)  # wrist camera in the hand frame: 10 cm out to the side of the hand
+ARM_CLEAR_M = 0.02       # derived takes (generated, retimed) keep the arms at least this far apart and each wrist
+CAM_CLEAR_M = 0.04       # camera this far from the other arm (closer and it may film the other arm's inside)
 # Build area: a taped square on the table (seen by the cameras, like tape on a real table). The tower only
 # counts when its base brick lies completely inside; bricks never start in it.
 BUILD_AREA_CENTER = (0.45, 0.0)
@@ -136,6 +139,13 @@ TOL_XY = 0.004
 TOL_Z = 0.003
 TOL_YAW = np.deg2rad(8)
 TOWER_STILL_MPS = 0.02
+# Start layout: every brick in its own small region, the same arrangement every episode, alternating sides in
+# build order so the arms can work in parallel (left arm: red base, yellow; right arm: blue, green). Nominal
+# yaw 0 (long side along x): a top-down gripper closes across the short side.
+SPAWN = {"red_2x4": (0.36, 0.20), "blue_2x3": (0.36, -0.20), "yellow_2x2": (0.56, 0.20),
+         "green_1x2x2": (0.56, -0.20)}
+SPAWN_JITTER_M = 0.04    # +- around the region centre, x and y
+SPAWN_YAW = np.deg2rad(15)
 
 
 def _stud_xy(n: int) -> np.ndarray:
@@ -277,18 +287,11 @@ def set_brick_pose(data: mujoco.MjData, name: str, pos, yaw: float = 0.0) -> Non
 
 
 def _randomize_task(model: mujoco.MjModel, data: mujoco.MjData, rng: np.random.Generator, th: float) -> None:
-    """Same bricks every episode; only where they start on the table changes (non-overlapping, outside the
-    build area)."""
-    placed: list[tuple[np.ndarray, float]] = []
+    """Same bricks every episode, each starting somewhere in its own SPAWN region (the regions never overlap
+    each other or the build area)."""
     for b in BRICKS:
-        r = float(np.hypot(*b.half))
-        for _ in range(1000):
-            xy = np.array([rng.uniform(0.30, 0.60), rng.uniform(-0.35, 0.35)])
-            to_area = np.maximum(np.abs(xy - BUILD_AREA_CENTER) - BUILD_AREA_HALF, 0.0)
-            if np.linalg.norm(to_area) > r + 0.02 and all(np.linalg.norm(xy - p) > r + pr + 0.02 for p, pr in placed):
-                break
-        placed.append((xy, r))
-        set_brick_pose(data, b.name, [*xy, th], yaw=rng.uniform(-np.pi / 2, np.pi / 2))
+        xy = np.asarray(SPAWN[b.name]) + rng.uniform(-SPAWN_JITTER_M, SPAWN_JITTER_M, 2)
+        set_brick_pose(data, b.name, [*xy, th], yaw=rng.uniform(-SPAWN_YAW, SPAWN_YAW))
 
 
 def _wrap(a: float, period: float) -> float:
@@ -472,11 +475,11 @@ def _add_arm(spec: mujoco.MjSpec, arm: str, cfg: SimConfig) -> None:
     # point midway between the finger pads that the arm is steered by. The web client colours it per arm.
     hand.add_geom(name="tcp_marker", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[0.005, 0, 0], pos=[0, 0, TCP_OFFSET],
                   rgba=[1, 1, 1, 1], group=OPERATOR_GROUP, contype=0, conaffinity=0, mass=0)
-    cam_pos = [0.1, 0.0, 0.0]
+    cam_pos = list(WRIST_CAM_POS)
     hand.add_camera(name="wrist_cam", pos=cam_pos,
                     xyaxes=lookat_xyaxes(cam_pos, [0, 0, 0.16], up=[1, 0, 0]), fovy=80)
     y = cfg.arm_spacing / 2 if arm == "l" else -cfg.arm_spacing / 2
-    frame = spec.worldbody.add_frame(pos=[0.0, y, cfg.table_height])
+    frame = spec.worldbody.add_frame(pos=[cfg.arm_base_x, y, cfg.table_height])
     spec.attach(panda, prefix=f"{arm}_", frame=frame)
 
 
@@ -535,6 +538,9 @@ class BimanualEnv:
         self._body_arm = np.array([1 if n.startswith("l_") else 2 if n.startswith("r_") else 0 for n in names])
         self._body_tip = np.array([n.endswith(("_hand", "_left_finger", "_right_finger")) for n in names])
         self._table_body = m.body("table").id
+        # ee_wrench(): the bodies whose contacts count as "on the hand", per arm (hand + both fingers).
+        self._hand_bodies = [np.array([m.body(f"{a}_{b}").id for b in ("hand", "left_finger", "right_finger")])
+                             for a in ARMS]
 
     @functools.cached_property
     def scene_hash(self) -> str:
@@ -654,7 +660,31 @@ class BimanualEnv:
             "ee_pose_right": ee[1],
             # (k, 7) [x y z qw qx qy qz] per tracked object
             "objects": np.stack([d.joint(f"{o}_free").qpos.copy() for o in OBJECTS]),
+            "ee_wrench": self.ee_wrench(),
         }
+
+    def ee_wrench(self) -> np.ndarray:
+        """(2, 6) [fx fy fz tx ty tz] per arm: the external wrench on the hand (hand + fingers) from everything
+        that is not that arm (bricks, table, the other arm), world axes, torque about the TCP, N and Nm. What a
+        real Franka estimates as O_F_ext_hat_K: a held brick's weight and pressing it down show up, the squeeze
+        between the fingers cancels out."""
+        m, d = self.model, self.data
+        out = np.zeros((2, 6))
+        f6 = np.zeros(6)
+        g1, g2 = d.contact.geom1, d.contact.geom2
+        B1, B2 = m.geom_bodyid[g1], m.geom_bodyid[g2]
+        for k, hands in enumerate(self._hand_bodies):
+            in1, in2 = np.isin(B1, hands), np.isin(B2, hands)
+            # one side on this hand, the other outside this arm (bricks, table, the other arm)
+            for i in np.flatnonzero((in1 & (self._body_arm[B2] != k + 1)) | (in2 & (self._body_arm[B1] != k + 1))):
+                c, on1 = d.contact[i], bool(in1[i])
+                mujoco.mj_contactForce(m, d, i, f6)
+                f = c.frame.reshape(3, 3).T @ f6[:3]  # on geom2 (the normal points from geom1 to geom2)
+                if on1:
+                    f = -f
+                out[k, :3] += f
+                out[k, 3:] += np.cross(c.pos - d.site_xpos[self.tcp_sites[k]], f)
+        return out
 
     def success(self) -> bool:
         return _task_success(self.model, self.data)
@@ -696,8 +726,94 @@ class BimanualEnv:
         mujoco.mj_setState(self.model, self.data, state[:self.mj_state_size], STATE_SPEC)
         mujoco.mj_forward(self.model, self.data)
 
+    def executed_targets(self, states: np.ndarray) -> np.ndarray:
+        """(T, 14) arm joint targets actually sent at each recorded step: the ctrl in the next step's state (it is
+        saved before that step's action). With DART these differ from action/joint_pos by the drift."""
+        ctrl_bit = int(mujoco.mjtState.mjSTATE_CTRL)  # elements are stored in bit order: ctrl follows the lower ones
+        before = mujoco.mj_stateSize(self.model, int(STATE_SPEC) & (ctrl_bit - 1))
+        ctrl = np.asarray(states)[:, before + self.arm_act]
+        return np.concatenate([ctrl[1:], ctrl[-1:]])  # the last step's target isn't saved: keep the one before
+
+    def tcp_poses_at(self, arm_q: np.ndarray) -> np.ndarray:
+        """(T, 2, 7) TCP poses [xyz qwxyz] at the given (T, 14) arm joint angles (forward kinematics only)."""
+        d = mujoco.MjData(self.model)
+        out = np.empty((len(arm_q), 2, 7))
+        for t, q in enumerate(arm_q):
+            d.qpos[self.arm_qadr] = q
+            mujoco.mj_kinematics(self.model, d)
+            for k, sid in enumerate(self.tcp_sites):
+                out[t, k, :3] = d.site_xpos[sid]
+                mujoco.mju_mat2Quat(out[t, k, 3:], d.site_xmat[sid])
+        return out
+
 
 # -- recorded scenes -------------------------------------------------------------------------------
+class ArmClearance:
+    """How close the arms come, from joint angles alone (kinematics of a robots-only model): the closest pair of
+    collision geoms of the two arms, and each wrist camera to the other arm. Physics contacts miss a camera inside
+    the other arm (cameras have no geometry), so derived takes check this too (ARM_CLEAR_M, CAM_CLEAR_M).
+
+    Each arm's geometry depends only on its own joints, so poses are computed per arm (`poses`) and any pairing of
+    a left and a right configuration is measured from those (`distance`), which is what a scheduler needs.
+    """
+
+    CAP = 0.2  # distances beyond this are reported as CAP
+
+    def __init__(self, cfg: SimConfig):
+        spec = build_spec(cfg, with_task=False)
+        for a in ARMS:
+            spec.body(f"{a}_hand").add_geom(name=f"{a}_wrist_cam_point", type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                                            size=[0.001, 0, 0], pos=list(WRIST_CAM_POS), contype=0, conaffinity=0,
+                                            group=4)
+        m = self.model = spec.compile()
+        self.data = mujoco.MjData(m)
+        self.qadr = {a: np.array([m.joint(f"{a}_{j}").qposadr[0] for j in ARM_JOINTS]) for a in ARMS}
+        self.geoms = {a: np.array([g for g in range(m.ngeom) if m.geom_contype[g]
+                                   and m.body(m.geom_bodyid[g]).name.startswith(f"{a}_")]) for a in ARMS}
+        self.cam = {a: m.geom(f"{a}_wrist_cam_point").id for a in ARMS}
+        self._ids = {a: np.r_[self.geoms[a], self.cam[a]] for a in ARMS}  # an arm's pose rows: geoms, then camera
+
+    def poses(self, arm: str, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(positions (T, G+1, 3), rotations (T, G+1, 9)) of one arm's collision geoms and wrist camera for its
+        joint angles q (T, 7)."""
+        m, d, ids = self.model, self.data, self._ids[arm]
+        q = np.atleast_2d(q)
+        pos, rot = np.empty((len(q), len(ids), 3)), np.empty((len(q), len(ids), 9))
+        for t, qt in enumerate(q):
+            d.qpos[self.qadr[arm]] = qt
+            mujoco.mj_kinematics(m, d)
+            pos[t], rot[t] = d.geom_xpos[ids], d.geom_xmat[ids]
+        return pos, rot
+
+    def distance(self, left: tuple[np.ndarray, np.ndarray],
+                 right: tuple[np.ndarray, np.ndarray]) -> tuple[float, float]:
+        """(arm-arm, camera-to-other-arm) distance [m] for one left and one right pose from `poses` (one step)."""
+        m, d = self.model, self.data
+        for a, (p, r) in (("l", left), ("r", right)):
+            d.geom_xpos[self._ids[a]], d.geom_xmat[self._ids[a]] = p, r
+        rb = m.geom_rbound
+        gl, gr = self.geoms["l"], self.geoms["r"]
+        pairs = {"arm": [(i, j) for i in gl for j in gr],
+                 "cam": [(self.cam["l"], j) for j in gr] + [(self.cam["r"], i) for i in gl]}
+        out = []
+        for kind in ("arm", "cam"):
+            g1, g2 = np.array(pairs[kind]).T
+            bound = np.linalg.norm(d.geom_xpos[g1] - d.geom_xpos[g2], axis=1) - rb[g1] - rb[g2]
+            best = self.CAP
+            for k in np.argsort(bound):  # bounding spheres first: most pairs are far apart
+                if bound[k] >= best:
+                    break
+                best = min(best, mujoco.mj_geomDistance(m, d, int(g1[k]), int(g2[k]), best, None))
+            out.append(best)
+        return out[0], out[1]
+
+    def measure(self, q: np.ndarray) -> np.ndarray:
+        """(T, 2) [arm-arm, camera] distances along a trajectory of both arms' joint angles (T, 14) [left, right]."""
+        q = np.atleast_2d(q)
+        left, right = self.poses("l", q[:, :7]), self.poses("r", q[:, 7:])
+        return np.array([self.distance((left[0][t], left[1][t]), (right[0][t], right[1][t])) for t in range(len(q))])
+
+
 def scene_hash(model: mujoco.MjModel) -> str:
     """Fingerprint of what shapes the physics and the images (geoms, masses, materials, cameras, state layout).
     Stored with every episode, so replaying or re-rendering it in a changed scene is caught."""
@@ -720,7 +836,12 @@ def load_recorded_model(xml: str) -> mujoco.MjModel:
 def env_from_episode(meta: dict) -> BimanualEnv:
     """The environment an episode was recorded in: built from its saved config (not today's config.yaml), and
     checked against its saved scene fingerprint (`env.scene_matches`; a mismatch is logged)."""
-    cfg = Config.model_validate(yaml.safe_load(meta["config_yaml"])) if meta.get("config_yaml") else load_config()
+    if meta.get("config_yaml"):
+        saved = yaml.safe_load(meta["config_yaml"])
+        saved.setdefault("sim", {}).setdefault("arm_base_x", 0.0)  # recorded before the bases moved back
+        cfg = Config.model_validate(saved)
+    else:
+        cfg = load_config()
     env = BimanualEnv(cfg)
     want = meta.get("scene_hash") or scene_hash(load_recorded_model(meta["model_xml"]))
     env.scene_matches = want == env.scene_hash
@@ -765,11 +886,21 @@ class AppearanceRandomizer:
 
 
 class CameraRenderer:
-    """Offscreen rendering of the named cameras (dashboard previews and LeRobot export)."""
+    """Offscreen rendering of the named cameras (dashboard previews, LeRobot export, policy input).
+
+    Flat, matte light: no shadows (moving arm shadows are clutter the policy would have to learn to ignore), no
+    specular highlights (the lights and the headlight at each camera made glare spots on the bricks and table that
+    move with the camera) and no floor reflection. Sets the model's light / headlight specular to 0, which only
+    rendering reads (the headset and dashboard scene use their own lights, with shadows to help the operator).
+    """
 
     def __init__(self, model: mujoco.MjModel, height: int, width: int, cameras: list[str]):
         self.cameras = list(cameras)
+        model.light_specular[:] = 0.0
+        model.vis.headlight.specular[:] = 0.0
         self.renderer = mujoco.Renderer(model, height=height, width=width)
+        for flag in (mujoco.mjtRndFlag.mjRND_SHADOW, mujoco.mjtRndFlag.mjRND_REFLECTION):
+            self.renderer.scene.flags[flag] = 0
 
     def render(self, data: mujoco.MjData) -> dict[str, np.ndarray]:
         out = {}

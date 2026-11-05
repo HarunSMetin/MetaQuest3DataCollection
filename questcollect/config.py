@@ -17,6 +17,10 @@ class SimConfig(BaseModel):
     control_hz: int = 50
     table_height: float = 0.75
     arm_spacing: float = 0.6
+    # Arm base x. At 0 the nearest bricks are 0.33 m from a base: a top-down grasp folds the elbow (joint 4) to
+    # within 0.1 rad of its limit, where the IK whips joints 1+3 / 5+7. -0.05 keeps it 0.4 rad clear, at the same
+    # manipulability for the farthest bricks. Episodes recorded before this setting existed used 0.
+    arm_base_x: float = -0.05
     gripper_force: float = 40.0  # N squeeze when closed on an object (real Franka Hand: <= 70 N)
 
 
@@ -37,6 +41,7 @@ class IKConfig(BaseModel):
     posture_cost: float = 0.01
     max_joint_vel: float = 2.5
     max_lead: float = 0.15
+    damping_cost: float = 0.1
     avoid_arm_collisions: bool = False
     collision_margin: float = 0.03
     iterations: int = 2
@@ -49,7 +54,8 @@ class RecordConfig(BaseModel):
         default_factory=lambda: ["cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist"]
     )
     operator: str = "operator"
-    action_noise: float = 0.0  # DART: std (rad) of noise on the executed joint targets; the clean target is recorded
+    action_noise: float = 0.003  # DART: std (rad) of a slow drift on the executed joint targets (~3.5 mm at the TCP);
+                                 # the clean target is recorded
 
 
 class ServerConfig(BaseModel):
@@ -65,6 +71,10 @@ class CurateConfig(BaseModel):
     max_link_table_frac: float = 0.01  # arm links (not the hand) resting on the table
     max_arm_arm_frac: float = 0.0
     max_tip_table_frac: float = 0.3    # hand/fingertips on the table: some is normal, bricks are 19 mm tall
+    # Contacts of these kinds are cut out of the take instead of rejecting it: the arm is blocked there, so the
+    # commanded targets are not what the policy should copy. The rest of the take is kept as segments.
+    cut_contacts: list[Literal["link_table", "arm_arm"]] = Field(default_factory=lambda: ["link_table", "arm_arm"])
+    contact_margin_s: float = 0.2      # also cut this long before and after each contact
     trim_idle: bool = True             # drop the still start and end of each episode
     dagger_frames: Literal["operator", "all"] = "operator"  # shared-control takes: only the operator's steps
 
@@ -75,6 +85,9 @@ class LearnConfig(BaseModel):
     image_size: list[int] = Field(default_factory=lambda: [240, 320])  # height, width
     action: Literal["joint", "ee"] = "joint"
     env_state: bool = False            # also export the brick poses (privileged: sim only)
+    joint_vel: bool = True             # observation.state also has the joint velocities
+    ee_wrench: bool = True             # ... and the external force/torque on each hand (as a Franka estimates it)
+    action_label: Literal["recorded", "executed"] = "executed"  # train on the targets sent (with the DART drift)
     datasets_dir: str = "data/lerobot"
     runs_dir: str = "outputs"
     presets: dict[str, dict[str, Any]] = Field(default_factory=lambda: {
@@ -82,14 +95,23 @@ class LearnConfig(BaseModel):
         "act_240": {"policy.type": "act", "policy.device": "cuda", "policy.use_amp": True,
                     "policy.chunk_size": 100, "policy.n_action_steps": 100, "policy.push_to_hub": False,
                     "batch_size": 16, "num_workers": 8, "steps": 100_000, "save_freq": 20_000},
+        # Diffusion Policy (experiments/diffusion/README.md): ~5.1 GB, ~76 samples/s, ~9.5 h for 80k steps.
+        "dp_240": {"policy.type": "diffusion", "policy.device": "cuda", "policy.use_amp": True,
+                   "policy.n_obs_steps": 1, "policy.horizon": 64, "policy.n_action_steps": 16,
+                   "policy.drop_n_last_frames": 48, "policy.resize_shape": [240, 320], "policy.crop_ratio": 0.9,
+                   "policy.use_separate_rgb_encoder_per_camera": True, "policy.down_dims": [256, 512, 1024],
+                   "policy.noise_scheduler_type": "DDIM", "policy.num_train_timesteps": 100,
+                   "policy.num_inference_steps": 10, "policy.push_to_hub": False,
+                   "batch_size": 32, "num_workers": 8, "steps": 80_000, "save_freq": 20_000},
     })
 
 
 class SafetyConfig(BaseModel):
-    """Filter on policy joint targets before they reach the arms (safety.py)."""
+    """Filter on every joint target, the operator's and a policy's, before it reaches the arms (safety.py)."""
     enabled: bool = True
     arm_margin: float = 0.02           # min distance between the two arms (m)
     table_margin: float = 0.01         # min distance between arm links and the table top (m)
+    finger_table_margin: float = 0.005  # min distance between the fingers and the table top (m); 0 = may touch
 
 
 class ControlConfig(BaseModel):

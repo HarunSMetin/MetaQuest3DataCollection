@@ -1,6 +1,7 @@
 """Exports an MjModel's visual geometry so the web client can rebuild the scene in three.js.
 
-The JSON describes bodies, visual geoms (primitive or mesh) and materials. Mesh vertex/face data
+The JSON describes bodies, visual geoms (primitive or mesh), materials and the cameras (so the headset can show
+where each recorded camera looks). Mesh vertex/face data
 goes in one binary blob (float32 vertices then uint32 faces per mesh). Meshes shared by both arms
 are deduplicated and large meshes are decimated (the Quest renders ~80k triangles instead of
 ~270k for the two arms). Normals are rebuilt client-side with crease-angle smoothing.
@@ -97,7 +98,12 @@ def export_scene(model: mujoco.MjModel) -> tuple[dict, bytes]:
 
     bodies = [{"id": b, "name": model.body(b).name, "parent": int(model.body_parentid[b])}
               for b in range(model.nbody)]
-    scene = {"nbody": int(model.nbody), "bodies": bodies, "geoms": geoms, "meshes": meshes, "blobSize": offset}
+    # MuJoCo cameras look along their -z with +y up, like three.js cameras; fovy is vertical, in degrees.
+    cameras = [{"name": model.camera(c).name, "body": int(model.cam_bodyid[c]), "pos": model.cam_pos[c].tolist(),
+                "quat": wxyz_to_xyzw(model.cam_quat[c]).tolist(), "fovy": float(model.cam_fovy[c])}
+               for c in range(model.ncam)]
+    scene = {"nbody": int(model.nbody), "bodies": bodies, "geoms": geoms, "meshes": meshes, "cameras": cameras,
+             "blobSize": offset}
     return scene, b"".join(blobs)
 
 

@@ -91,7 +91,15 @@ export class Hud {
 
     // --- hint / success line ------------------------------------------------------------------
     const hy = py + 214;
-    if (s.success && (s.rec_state === "recording" || s.rec_state === "review")) {
+    const r = s.rec_state === "review" ? s.review : null;
+    if (r) {
+      // The take as training would see it (same rules as `qc audit`), so a bad take can be discarded right away.
+      const ev = r.events;
+      const facts = `${r.duration_s.toFixed(0)} s  ·  arm on table ${ev.link_table}×  ·  arms touched ${ev.arm_arm}×  ·  idle ${r.idle_pct}%`;
+      if (r.rejected) text(g, `✗  Training skips it: ${r.rejected}`, tx, hy, 27, { color: THEME.warn, weight: 800 });
+      else text(g, `✓  Training uses ${r.used_s.toFixed(0)} s`, tx, hy, 30, { color: THEME.ok, weight: 800 });
+      text(g, facts, tx, hy + 40, 23, { color: THEME.dim, weight: 600 });
+    } else if (s.success && (s.rec_state === "recording" || s.rec_state === "review")) {
       text(g, "✓  Task solved", tx, hy, 34, { color: THEME.ok, weight: 800 });
     } else if (s.rec_state === "idle" && !s.replay) {
       const hint = s.mode === "controllers"

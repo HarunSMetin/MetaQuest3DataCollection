@@ -100,6 +100,7 @@ export function parsePoseFrame(buf: ArrayBuffer): PoseFrame | null {
 
 // ---- JSON messages ----------------------------------------------------------------------
 
+
 export interface Status {
   type: "status";
   task: string;
@@ -133,7 +134,16 @@ export interface Status {
   loop_hz: number;
   connected: boolean;
   placement: number[]; // column-major 4x4, world -> xr
-  replay: { path: string; i: number; n: number } | null;
+  replay: { path: string; i: number; n: number; paused: boolean; speed: number; loop: boolean } | null;
+  /** The take under review, judged by the curation rules (`qc audit`): null outside review. */
+  review: {
+    duration_s: number;
+    success: boolean;
+    idle_pct: number;
+    events: { link_table: number; arm_arm: number; tip_table: number };
+    rejected: string | null; // why training would skip it
+    used_s: number; // seconds a dataset would use (contact moments and idle ends cut)
+  } | null;
   /** Who drives the arms (runtime.py CONTROL_MODES); `policy` is null unless `qc serve --policy` loaded one. */
   control: {
     mode: "teleop" | "policy" | "shared";
@@ -169,19 +179,43 @@ export async function fetchTask(): Promise<TaskSpec> {
 export interface EpisodeRow {
   path: string;
   file: string;
-  success: boolean;
+  success: boolean; // the label: recorded_success unless changed by hand
+  recorded_success: boolean;
   duration_s: number;
   num_steps: number;
   input_mode: string;
   operator: string;
   created_at: string;
-  source: "teleop" | "policy" | "shared";
+  source: "teleop" | "policy" | "shared" | "retimed" | "generated";
+  /** Derived episodes: the file this one was generated or retimed from, and how. */
+  origin: string | null;
+  generation: { seed: number; tower_yaw_deg: number; base_shift_m: number[]; spawn_jitter_m: number; spawn_yaw_deg: number } | null;
+  retime_moves: number | null; // retimed: pieces that start earlier than recorded
+  /** Manual labels (curation.json), edited with PATCH /api/episodes/<file>. */
+  tags: string[];
+  note: string;
+  excluded: boolean; // left out of training datasets by hand
 }
+
+/** GET /api/datasets: the episode folders under data/ (the recording folder first). */
+export interface DatasetRow {
+  name: string;
+  recording: boolean; // record.out_dir: new takes land here; the only folder where episodes can be deleted
+  count: number;
+  title: string;
+  description: string;
+}
+
+/** PATCH /api/episodes/<file> body; success null = back to the recorded label. */
+export type EpisodeEdit = Partial<{ tags: string[]; note: string; exclude: boolean; success: boolean | null }>;
 
 /** GET /api/audit (questcollect/audit.py): per episode file, its quality and whether training datasets use it. */
 export type AuditRows = Record<string, {
   contact_frac: { link_table: number; arm_arm: number; tip_table: number };
+  contact_events: { link_table: number; arm_arm: number; tip_table: number };
   idle_frac: number;
-  excluded: boolean; // excluded by hand (curation.json)
+  level_times: (number | null)[]; // seconds until each tower level clicked in
+  fps: number;
+  success: boolean;
   verdict: string | null; // why a dataset would leave it out; null = used
 }>;

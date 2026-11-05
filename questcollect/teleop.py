@@ -231,6 +231,7 @@ class _ArmState:
         self.hold_p = np.zeros(3)
         self.hold_R = np.eye(3)
         self.last_raw: np.ndarray | None = None
+        self.last_filtered: tuple[np.ndarray, np.ndarray] | None = None  # filtered hand pose of the last tick
 
     def drop_tracking(self) -> None:
         """Tracking lost or glitched: disengage until the operator engages again."""
@@ -265,6 +266,7 @@ class Teleop:
         for a, st in self.arms.items():
             if not st.clutch.engaged:
                 st.hold_p, st.hold_R = ee_poses[a][0].copy(), ee_poses[a][1].copy()
+
 
     def release_all(self) -> None:
         """Drop every clutch, e.g. after the mapping changed, so re-engaging starts from the held target."""
@@ -312,6 +314,7 @@ class Teleop:
                     st.drop_tracking()
                     engage = False
                 p_f, R_f = st.pos_filter(p_w, dt), st.rot_filter(R_w, dt)
+                st.last_filtered = (p_f, R_f)
 
                 if engage and not st.clutch.engaged:
                     st.clutch.engage(p_f, R_f, st.hold_p, st.hold_R)

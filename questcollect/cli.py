@@ -217,6 +217,44 @@ def audit(
 
 
 @app.command()
+def retime(
+    episodes: list[Path] = typer.Argument(None, help="Episode files (default: every episode in record.out_dir)"),
+    out: Path = typer.Option(Path("data/episodes_retimed"), help="Folder for the retimed episodes"),
+    config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
+    jobs: int = typer.Option(min(6, max(1, (os.cpu_count() or 2) - 1)),
+                             help="Episodes simulated in parallel (~0.8 GB each)"),
+):
+    """Experimental: reschedule takes so both arms work at once (one arm at the tower at a time, clearance between
+    the arms and their wrist cameras), re-simulate, keep what still builds the tower. Source episodes are not
+    changed; export the result with `qc export --raw <out>`."""
+    _headless_gl()
+    from concurrent.futures import ProcessPoolExecutor
+
+    from questcollect.recorder import episode_files
+    from questcollect.retime import retime_episode
+
+    files = episodes or episode_files(load_config(config).out_dir)
+    out = out if out.is_absolute() else ROOT / out
+    total_before = total_after = 0
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(retime_episode, f, out): f for f in files}
+        for fut, f in futures.items():
+            try:
+                r = fut.result()
+            except Exception as e:  # noqa: BLE001 - one bad episode must not stop the batch
+                typer.secho(f"  {f.name}: skipped ({e})", fg="yellow")
+                continue
+            total_before, total_after = total_before + r.steps_before, total_after + r.steps_after
+            c = r.min_clearance
+            typer.echo(f"  {f.name}: {r.steps_before / r.fps:6.1f}s -> {r.steps_after / r.fps:6.1f}s "
+                       f"({r.saved_frac:4.0%} shorter), {len(r.moves)} moves earlier, {r.rejected} retries"
+                       + (f", closest arms {c['arm_m'] * 100:.1f} cm, camera {c['cam_m'] * 100:.1f} cm" if c else "")
+                       + ("" if r.path else "  (no shorter schedule, not written)"))
+    if total_before:
+        typer.secho(f"\n{1 - total_after / total_before:.0%} shorter overall -> {out}", fg="green")
+
+
+@app.command()
 def export(
     name: str = typer.Argument(..., help="Dataset name: written to <learn.datasets_dir>/<name>"),
     config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),

@@ -1,4 +1,5 @@
-"""Real-time sim thread: input -> teleop -> IK (or policy -> safety filter) -> physics -> recording -> publish.
+"""Real-time sim thread: input -> teleop -> IK (or policy) -> safety filter -> physics -> recording
+-> publish.
 
 The network layer talks to this only through thread-safe methods (submit_input, command,
 latest_pose_frame, status, previews) and event listeners.
@@ -15,11 +16,12 @@ from typing import Callable
 
 import numpy as np
 
+from questcollect.audit import CONTACT_KINDS, audit_arrays, kept_spans, verdict
 from questcollect.config import Config
 from questcollect.frames import mat_to_quat_wxyz, quat_wxyz_to_mat
 from questcollect.ik import BimanualIK
 from questcollect.protocol import FLAG_ENGAGED_L, FLAG_ENGAGED_R, FLAG_RECORDING, InputFrame, pack_pose_frame
-from questcollect.recorder import (SOURCE_OPERATOR, SOURCE_POLICY, Recorder, RecState, list_episodes, make_step,
+from questcollect.recorder import (SOURCE_OPERATOR, SOURCE_POLICY, Recorder, RecState, make_step,
                                    read_episode, teleop_fields)
 from questcollect.safety import SafetyFilter
 from questcollect.scene_export import body_poses, export_scene
@@ -32,7 +34,11 @@ STATUS_EVERY = 5          # ticks (10 Hz at 50 Hz control)
 PREVIEW_EVERY = 6         # ticks (~8 Hz)
 PREVIEW_SIZE = (240, 320)
 IK_WARN_M = 0.03
+DART_TAU_S = 0.5           # DART drift correlation time: slow drifts the operator sees and corrects
+DART_SMOOTH_S = 0.2        # ... low-passed once more, so the arm drifts instead of trembling
+BLOCKED_RAD = 0.05          # the safety filter changed a joint target this much: warn the operator
 CONTROL_MODES = ("teleop", "policy", "shared")  # shared: the policy drives until the operator takes control
+REPLAY_SPEED_RANGE = (0.1, 8.0)  # slowest / fastest dashboard replay speed
 # Task haptics: (intensity, ms, repeat, gap_ms). Distinct patterns so the operator can tell them apart.
 # Most come with a sound cue of the same name (web/src/xr/sounds.ts), panned to that arm's side.
 HAPTIC_GRASP = (0.5, 40, 1, 0)        # fingers closed on a brick
@@ -62,12 +68,17 @@ class Runtime:
         self.recorder = Recorder(cfg, cfg.out_dir)
         self._scene_json, self._scene_blob = export_scene(self.env.model)
         # Who drives: the operator (teleop), a trained policy, or the policy until the operator takes over (shared).
+        # Either way the safety filter keeps the arms off each other and the table.
         self.safety = SafetyFilter(cfg.sim, cfg.ik, cfg.safety, self.dt)
         self.policy = None  # learn.policy.PolicyRunner, see load_policy
         self.control_mode = "teleop"
         self._driver = "operator"
         self._safety_rad = 0.0
         self._noise = np.random.default_rng()
+        self._dart = np.zeros(14)  # current DART offset on the executed joint targets (rad)
+        self._dart_ou = np.zeros(14)  # ... before smoothing
+        # The smoothing shrinks the drift; scaled so its std is still record.action_noise.
+        self._dart_gain = cfg.record.action_noise * np.sqrt(1 + DART_SMOOTH_S / DART_TAU_S)
         if cfg.control.policy:
             self.load_policy(cfg.control.policy)
             self.control_mode = cfg.control.mode
@@ -95,7 +106,8 @@ class Runtime:
         self._tick_count = 0
         self._loop_hz = float(cfg.sim.control_hz)
         self._replay: dict | None = None
-        self._warn = {"arm_collision": False, "table_collision": False, "ik_saturated": False}
+        self._replay_speed, self._replay_loop = 1.0, False  # kept across replays (dashboard settings)
+        self._warn = {"arm_collision": False, "table_collision": False, "ik_saturated": False, "blocked": False}
         self._reach = {a: False for a in ARMS}
         self._engaged = {a: False for a in ARMS}
         self._warn_sound_at: dict[tuple[str, str | None], float] = {}
@@ -106,6 +118,7 @@ class Runtime:
         self._complete = False
         self._hold_tick_at = {a: 0.0 for a in ARMS}
         self._quiet_until = {a: 0.0 for a in ARMS}
+        self._review: tuple[int, dict] | None = None  # (steps, summary) of the take under review
         self._reset_scene()
 
     def load_policy(self, run: str | Path) -> None:
@@ -162,9 +175,6 @@ class Runtime:
     def task(self) -> dict:
         return task_spec()
 
-    def episodes(self) -> list[dict]:
-        return list_episodes(self.cfg.out_dir)
-
     # -- internals ---------------------------------------------------------------------------------
     def _emit(self, event: dict) -> None:
         for fn in self._listeners:
@@ -201,6 +211,7 @@ class Runtime:
         self._base_in_area = False
         self.ik.reset(obs["joint_pos"])
         self.teleop.reset({a: self._ik_pose(a) for a in ARMS})
+        self.safety.reset(obs["joint_pos"])
         self._driver = "operator"  # a policy starts a fresh chunk on its first tick
 
     def _ik_pose(self, arm: str) -> tuple[np.ndarray, np.ndarray]:
@@ -244,6 +255,9 @@ class Runtime:
     def _handle(self, name: str, kw: dict, now: float) -> None:
         rec = self.recorder
         if name == "record_toggle":
+            if self._replay is not None and rec.state == RecState.IDLE:
+                self._replay = None
+                self._reset_scene()
             was = rec.state
             rec.toggle(now)
             if was == RecState.IDLE and rec.state == RecState.COUNTDOWN:
@@ -280,8 +294,23 @@ class Runtime:
         elif name == "replay":
             if rec.state == RecState.IDLE:
                 _, data = read_episode(kw["path"], keys=["sim/state"])
-                self._replay = {"path": kw["path"], "states": data["sim/state"], "i": 0}
-                self._toast(f"Replaying {kw['path'].rsplit('/', 1)[-1]}")
+                states = data["sim/state"]
+                self._replay = {"path": kw["path"], "states": states, "paused": bool(kw.get("paused", False)),
+                                "i": int(np.clip(kw.get("i", 0), 0, len(states) - 1)), "acc": 0.0}
+        elif name == "replay_pause":
+            if self._replay is not None:
+                r = self._replay
+                r["paused"] = bool(kw.get("paused", not r["paused"]))
+                if not r["paused"] and r["i"] >= len(r["states"]) - 1:
+                    r["i"] = 0  # play again from the start
+        elif name == "replay_options":
+            if "speed" in kw:
+                self._replay_speed = float(np.clip(kw["speed"], REPLAY_SPEED_RANGE[0], REPLAY_SPEED_RANGE[1]))
+            if "loop" in kw:
+                self._replay_loop = bool(kw["loop"])
+        elif name == "replay_seek":
+            if self._replay is not None:
+                self._replay["i"] = int(np.clip(kw.get("i", 0), 0, len(self._replay["states"]) - 1))
         elif name == "replay_stop":
             self._replay = None
             self._reset_scene()
@@ -303,11 +332,16 @@ class Runtime:
         if self._replay is not None:
             r = self._replay
             env.set_state(r["states"][r["i"]])
-            r["i"] += 1
-            if r["i"] >= len(r["states"]):
-                self._replay = None
-                self._toast("Replay finished")
-                self._reset_scene()
+            if not r["paused"]:
+                r["acc"] += self._replay_speed  # recorded steps per tick: speed 1 = real time
+                steps, r["acc"] = int(r["acc"]), r["acc"] % 1.0
+                last = len(r["states"]) - 1
+                if r["i"] + steps <= last:
+                    r["i"] += steps
+                elif self._replay_loop:
+                    r["i"] = 0
+                else:
+                    r["i"], r["paused"] = last, True  # hold the last frame until replay_stop
             self._publish(now, None)
             return
 
@@ -328,22 +362,13 @@ class Runtime:
         if driver == "policy":
             if self._driver != "policy":  # (re)starting: a fresh chunk from the current state
                 self.policy.reset(env)
-                self.safety.reset(q_measured)
-            q_policy, grippers = self.policy.act(env)
-            q_target, self._safety_rad = self.safety.filter(q_policy, q_measured)
-            ee = self.safety.tcp_poses()
-            # Keep the operator side where the arms are, so taking control (Grip) never makes them jump.
-            self.ik.reset(q_target)
-            self.teleop.sync_hold({a: self._ik_pose(a) for a in ARMS})
+            q_wanted, grippers = self.policy.act(env)
         else:
             for a in ARMS:
                 p, R = out.targets[a]
                 self.ik.set_target(a, p, mat_to_quat_wxyz(R))
             self.ik.follow(q_measured)
-            q_target, grippers = self.ik.solve(), out.grippers
-            self._safety_rad = 0.0
-            ee = [np.concatenate([p, mat_to_quat_wxyz(R)]) for p, R in (out.targets[a] for a in ARMS)]
-        self._driver = driver
+            q_wanted, grippers = self.ik.solve(), out.grippers
 
         prev_state = self.recorder.state
         self.recorder.tick(now)
@@ -356,11 +381,25 @@ class Runtime:
             obs = env.observe()
             state = env.get_state()
             contacts = env.contact_flags()
-        q_exec = q_target
-        if recording and driver == "operator" and self.cfg.record.action_noise > 0:
-            # DART: execute a slightly perturbed target but record the operator's clean one, so the data shows
-            # how the operator recovers from small errors (Laskey et al., 2017).
-            q_exec = q_target + self._noise.normal(0.0, self.cfg.record.action_noise, q_target.shape)
+        # DART: execute a slightly perturbed target but record the operator's clean one, so the data shows how the
+        # operator recovers from small errors (Laskey et al., 2017). The offset is a slow random drift: an
+        # Ornstein-Uhlenbeck process (correlation DART_TAU_S) smoothed once more (DART_SMOOTH_S), because a raw OU
+        # path is rough at the 20 ms scale and the arm visibly trembles (measured 0.4 mm per tick). Only on arms the
+        # operator is moving, while recording; otherwise it decays to zero, never jumps.
+        a, b = self.dt / DART_TAU_S, self.dt / DART_SMOOTH_S
+        on = np.repeat([recording and driver == "operator" and out.engaged[arm] for arm in ARMS], 7)
+        self._dart_ou += -a * self._dart_ou + on * self._dart_gain * np.sqrt(2 * a) * self._noise.standard_normal(14)
+        self._dart += b * (self._dart_ou - self._dart)
+        # The drift goes in before the safety filter, so it can't push a hand onto the table or the other arm;
+        # the recorded action is what was executed minus the drift.
+        q_exec, self._safety_rad = self.safety.filter(q_wanted + self._dart, q_measured, env.data.qpos[env.finger_qadr])
+        q_target = q_exec - self._dart
+        ee = self.safety.tcp_poses(q_target)
+        if driver == "policy":
+            # Keep the operator side where the arms are, so taking control (Grip) never makes them jump.
+            self.ik.reset(q_target)
+            self.teleop.sync_hold({a: self._ik_pose(a) for a in ARMS})
+        self._driver = driver
         env.apply_action(q_exec, grippers)
         success = env.success()
 
@@ -438,7 +477,9 @@ class Runtime:
         link_table, arm_hit, tip_table = (bool(f) for f in self.env.contact_flags())
         table_hit = link_table or tip_table
         reach = {a: e[0] > IK_WARN_M for a, e in self.ik.errors().items()}
-        new = {"arm_collision": arm_hit, "table_collision": table_hit, "ik_saturated": any(reach.values())}
+        blocked = self._safety_rad > BLOCKED_RAD  # the operator pushes into the table or the other arm
+        new = {"arm_collision": arm_hit, "table_collision": table_hit, "ik_saturated": any(reach.values()),
+               "blocked": blocked}
         for k, v in new.items():
             if v and not self._warn[k]:
                 self._haptic_both(0.3, 30)
@@ -446,6 +487,8 @@ class Runtime:
             self._warn_sound("collision", None, now)
         if table_hit and not self._warn["table_collision"]:
             self._warn_sound("table", None, now)
+        if blocked and not self._warn["blocked"]:
+            self._warn_sound("collision", None, now)
         for a in ARMS:
             if reach[a] and not self._reach[a]:
                 self._warn_sound("out_of_reach", a, now)
@@ -471,6 +514,29 @@ class Runtime:
             jpegs = self._preview_renderer.render_jpeg(env.data)
             with self._out_lock:
                 self._previews = jpegs
+
+    def _review_summary(self) -> dict | None:
+        """Quality of the take under review, judged by the same rules `qc audit` and export use, so the operator
+        can discard a take that training would not use anyway (computed once per take)."""
+        rec = self.recorder
+        if rec.state != RecState.REVIEW or not rec.steps:
+            self._review = None
+            return None
+        if self._review is None or self._review[0] != len(rec.steps):
+            steps = rec.steps
+            data = {"obs/joint_vel": np.array([s["obs"]["joint_vel"] for s in steps]),
+                    "teleop/engaged": np.array([s["teleop"]["engaged"] for s in steps]),
+                    "progress": np.array([s["progress"] for s in steps]),
+                    "contacts": np.array([s["contacts"] for s in steps]),
+                    "control/source": np.array([s["control"]["source"] for s in steps])}
+            a = audit_arrays("take", self.cfg.sim.control_hz, rec.success_seen, data)
+            why = verdict(a, self.cfg.curate, {})
+            used = 0 if why else sum(e - s for s, e in kept_spans(a, self.cfg.curate))
+            self._review = (len(steps), {
+                "duration_s": round(a.duration_s, 1), "success": a.success, "idle_pct": round(100 * a.idle_frac),
+                "events": {k: a.contact_events[k] for k in CONTACT_KINDS},
+                "rejected": why, "used_s": round(used / a.fps, 1)})
+        return self._review[1]
 
     def _update_status(self, now: float, out, success: bool) -> None:
         rec = self.recorder
@@ -516,8 +582,10 @@ class Runtime:
             "control": {"mode": self.control_mode, "driver": self._driver,
                         "policy": None if self.policy is None else self.policy.name,
                         "safety_rad": round(self._safety_rad, 3)},
+            "review": self._review_summary(),
             "replay": None if self._replay is None else {
-                "path": self._replay["path"], "i": self._replay["i"], "n": len(self._replay["states"])},
+                "path": self._replay["path"], "i": self._replay["i"], "n": len(self._replay["states"]),
+                "paused": self._replay["paused"], "speed": self._replay_speed, "loop": self._replay_loop},
         }
         with self._out_lock:
             self._status = status

@@ -36,6 +36,23 @@ def read_manifest(dataset_root: Path) -> dict:
     return json.loads((Path(dataset_root) / MANIFEST).read_text())
 
 
+def _wrench_at(env, state: np.ndarray) -> np.ndarray:
+    env.set_state(state)
+    return env.ee_wrench()
+
+
+def executed_actions(env, states: np.ndarray, data: dict) -> dict:
+    """data with action/joint_pos and action/ee_pose replaced by the targets actually sent (DART drift included;
+    the grippers carry no drift). The recorded ones are the operator's targets before the drift, which the operator
+    only partly corrects for: near a click they are a median 2 mm off where the brick was actually seated."""
+    q = env.executed_targets(states)
+    joint = data["action/joint_pos"].copy()
+    joint[:, :7], joint[:, 8:15] = q[:, :7], q[:, 7:]
+    ee = data["action/ee_pose"].copy()
+    ee[:, :14] = env.tcp_poses_at(q).reshape(len(q), 14)
+    return {**data, "action/joint_pos": joint, "action/ee_pose": ee}
+
+
 def export(segments: list[Segment], out: Path, spec: FeatureSpec, repo_id: str, randomize_visuals: bool = False,
            extra_manifest: dict | None = None, progress=None) -> int:
     """Write the segments as LeRobot episodes into `out` (must not exist yet). Returns the number of episodes."""
@@ -69,6 +86,10 @@ def export(segments: list[Segment], out: Path, spec: FeatureSpec, repo_id: str, 
         if states.shape[1] != env.state_size:
             raise RuntimeError(f"{seg.path.name}: recorded state size {states.shape[1]} != scene {env.state_size}")
         obs = episode_obs(data)
+        if spec.ee_wrench and "ee_wrench" not in obs:  # recorded before obs/ee_wrench (schema v7): from the states
+            obs["ee_wrench"] = np.stack([_wrench_at(env, s) for s in states])
+        if spec.action_label == "executed":
+            data = executed_actions(env, states, data)
         state, action = spec.state(obs), spec.recorded_action(data)
         env_state = spec.environment_state(obs) if spec.env_state else None
         for t in range(seg.start, seg.stop):

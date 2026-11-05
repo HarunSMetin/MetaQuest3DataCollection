@@ -70,7 +70,7 @@ def rollout(env: BimanualEnv, runner: PolicyRunner, safety: SafetyFilter, seed: 
     for t in range(max_steps):
         obs, state, flags = env.observe(), env.get_state(), env.contact_flags()
         q_policy, grippers = runner.act(env)
-        q, change = safety.filter(q_policy, env.data.qpos[env.arm_qadr])
+        q, change = safety.filter(q_policy, env.data.qpos[env.arm_qadr], env.data.qpos[env.finger_qadr])
         env.apply_action(q, grippers)
         success, prog = env.success(), env.progress()
         if record:

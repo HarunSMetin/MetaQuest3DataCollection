@@ -6,7 +6,8 @@ still, when each tower level clicked in, and who drove (operator or policy). `se
 is built from, with a reason for every rejected episode.
 
 Raw episodes are never modified: audits are cached in <episodes>/audit.json, manual decisions live in
-<episodes>/curation.json ({"episode_000001.hdf5": {"exclude": true, "note": "..."}}).
+<episodes>/curation.json ({"episode_000001.hdf5": {"exclude": true, "note": "...", "tags": ["slow"], "success": false}};
+every field optional; `success` overrides the label saved with the take).
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from questcollect.config import CurateConfig
 from questcollect.recorder import SOURCE_OPERATOR, episode_files, read_episode
 from questcollect.sim import LEVELS
 
-AUDIT_VERSION = 2
+AUDIT_VERSION = 3
 CACHE_NAME = "audit.json"
 CURATION_NAME = "curation.json"
 CONTACT_KINDS = ("link_table", "arm_arm", "tip_table")  # order of BimanualEnv.contact_flags
@@ -42,6 +43,7 @@ class EpisodeAudit:
     active: tuple[int, int]                  # [start, stop): first to last step with motion
     level_times: list[float | None]          # seconds until each tower level (1..LEVELS) first clicked in
     operator_runs: list[tuple[int, int]] = field(default_factory=list)  # [start, stop) driven by the operator
+    contact_runs: dict[str, list[tuple[int, int]]] = field(default_factory=dict)  # [start, stop) per contact kind
 
     @property
     def duration_s(self) -> float:
@@ -86,23 +88,27 @@ def _replay_contacts(path: Path, meta: dict, envs: dict) -> np.ndarray:
 def audit_episode(path: Path, envs: dict | None = None) -> EpisodeAudit:
     """Audit one episode file (envs: scenes reused between episodes recorded with the same config)."""
     meta, data = read_episode(path, keys=AUDIT_KEYS)
-    contacts = data.get("contacts")
-    if contacts is None:
-        contacts = _replay_contacts(path, meta, {} if envs is None else envs)
-    n = len(data["progress"])
-    moving = (np.abs(data["obs/joint_vel"]).max(axis=1) > IDLE_SPEED) | data["teleop/engaged"].any(axis=1)
+    if data.get("contacts") is None:
+        data["contacts"] = _replay_contacts(path, meta, {} if envs is None else envs)
+    return audit_arrays(Path(path).name, int(meta["fps"]), bool(meta.get("success")), data)
+
+
+def audit_arrays(file: str, fps: int, success: bool, data: dict) -> EpisodeAudit:
+    """The audit of one take from its AUDIT_KEYS arrays (an episode file, or a take still in memory)."""
+    contacts, progress = np.asarray(data["contacts"], bool), np.asarray(data["progress"])
+    n = len(progress)
+    moving = (np.abs(data["obs/joint_vel"]).max(axis=1) > IDLE_SPEED) | np.asarray(data["teleop/engaged"]).any(axis=1)
     active = (int(np.argmax(moving)), int(n - np.argmax(moving[::-1]))) if moving.any() else (0, 0)
-    source = data.get("control/source", np.full(n, SOURCE_OPERATOR))
-    fps = int(meta["fps"])
-    progress = data["progress"]
+    source = np.asarray(data.get("control/source", np.full(n, SOURCE_OPERATOR)))
     return EpisodeAudit(
-        file=Path(path).name, num_steps=n, fps=fps, success=bool(meta.get("success")),
+        file=file, num_steps=n, fps=fps, success=success,
         contact_frac={k: float(contacts[:, i].mean()) for i, k in enumerate(CONTACT_KINDS)},
         contact_events={k: len(true_runs(contacts[:, i])) for i, k in enumerate(CONTACT_KINDS)},
         idle_frac=float(1.0 - moving.mean()), active=active,
         level_times=[float(np.argmax(progress >= k)) / fps if (progress >= k).any() else None
                      for k in range(1, LEVELS + 1)],
         operator_runs=true_runs(source == SOURCE_OPERATOR),
+        contact_runs={k: true_runs(contacts[:, i]) for i, k in enumerate(CONTACT_KINDS)},
     )
 
 
@@ -125,6 +131,7 @@ def audit_dir(episodes_dir: Path, progress=None) -> dict[str, EpisodeAudit]:
             a = EpisodeAudit(**entry["audit"])
             a.active = tuple(a.active)
             a.operator_runs = [tuple(r) for r in a.operator_runs]
+            a.contact_runs = {k: [tuple(r) for r in v] for k, v in a.contact_runs.items()}
         else:
             if progress:
                 progress(path.name)
@@ -142,29 +149,89 @@ def load_curation(episodes_dir: Path) -> dict[str, dict]:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
-def set_curation(episodes_dir: Path, file: str, exclude: bool, note: str = "") -> None:
-    """Exclude an episode from training datasets by hand (or include it again)."""
+CURATION_FIELDS = {"exclude": bool, "note": str, "tags": list, "success": bool}
+
+
+def update_curation(episodes_dir: Path, file: str, **fields) -> dict:
+    """Change the manual fields of one episode (CURATION_FIELDS); None, False for exclude, "" and [] clear a field.
+    Returns the episode's entry."""
     cur = load_curation(episodes_dir)
-    if exclude:
-        cur[file] = {"exclude": True, "note": note}
+    entry = cur.get(file, {})
+    for k, v in fields.items():
+        if k not in CURATION_FIELDS:
+            raise ValueError(f"unknown curation field {k!r}")
+        if k == "tags" and v is not None:
+            v = sorted({str(t).strip()[:32] for t in v if str(t).strip()})
+        if v is None or v == "" or v == [] or (k == "exclude" and not v):
+            entry.pop(k, None)
+        else:
+            entry[k] = CURATION_FIELDS[k](v)
+    if entry:
+        cur[file] = entry
     else:
         cur.pop(file, None)
     (Path(episodes_dir) / CURATION_NAME).write_text(json.dumps(cur, indent=1, sort_keys=True))
+    return entry
+
+
+def set_curation(episodes_dir: Path, file: str, exclude: bool, note: str = "") -> None:
+    """Exclude an episode from training datasets by hand (or include it again)."""
+    update_curation(episodes_dir, file, exclude=exclude, note=note)
+
+
+def forget_curation(episodes_dir: Path, file: str) -> None:
+    """Drop the manual fields of a deleted episode."""
+    cur = load_curation(episodes_dir)
+    if cur.pop(file, None) is not None:
+        (Path(episodes_dir) / CURATION_NAME).write_text(json.dumps(cur, indent=1, sort_keys=True))
+
+
+def labelled_success(a: EpisodeAudit, curation: dict) -> bool:
+    """The take's success label: the manual override if there is one, else the one saved with the take."""
+    return bool(curation.get(a.file, {}).get("success", a.success))
 
 
 def verdict(a: EpisodeAudit, rules: CurateConfig, curation: dict) -> str | None:
     """Why an episode is left out of training datasets, or None if it is used."""
     if curation.get(a.file, {}).get("exclude"):
         return "excluded by hand" + (f": {curation[a.file]['note']}" if curation[a.file].get("note") else "")
-    if not a.success and not rules.include_failures:
+    if not labelled_success(a, curation) and not rules.include_failures:
         return "failed take"
     limits = {"link_table": (rules.max_link_table_frac, "arm link on the table"),
               "arm_arm": (rules.max_arm_arm_frac, "arms touching"),
               "tip_table": (rules.max_tip_table_frac, "hand dragging on the table")}
     for kind, (limit, what) in limits.items():
+        if kind in rules.cut_contacts:  # cut out in select instead
+            continue
         if a.contact_frac[kind] > limit:
             return f"{what} {a.contact_frac[kind]:.1%} of the time (limit {limit:.1%})"
     return None
+
+
+def _without(span: tuple[int, int], cuts: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The parts of [start, stop) that no cut covers, in order."""
+    start, stop = span
+    out = []
+    for cut_start, cut_stop in sorted(cuts):
+        if cut_stop <= start or cut_start >= stop:
+            continue
+        if cut_start > start:
+            out.append((start, cut_start))
+        start = max(start, cut_stop)
+    if start < stop:
+        out.append((start, stop))
+    return out
+
+
+def kept_spans(a: EpisodeAudit, rules: CurateConfig) -> list[tuple[int, int]]:
+    """[start, stop) of the steps of an accepted take that go into a dataset: idle ends trimmed, only the
+    operator's steps of a shared-control take, cut contacts removed, pieces shorter than MIN_SEGMENT_S dropped."""
+    lo, hi = a.active if rules.trim_idle else (0, a.num_steps)
+    runs = a.operator_runs if rules.dagger_frames == "operator" else [(0, a.num_steps)]
+    margin = round(rules.contact_margin_s * a.fps)
+    cuts = [(max(0, s - margin), e + margin) for kind in rules.cut_contacts for s, e in a.contact_runs.get(kind, [])]
+    pieces = [part for s, e in runs for part in _without((max(s, lo), min(e, hi)), cuts)]
+    return [(s, e) for s, e in pieces if e - s >= MIN_SEGMENT_S * a.fps]
 
 
 def select(episodes_dir: Path, audits: dict[str, EpisodeAudit], rules: CurateConfig,
@@ -177,10 +244,7 @@ def select(episodes_dir: Path, audits: dict[str, EpisodeAudit], rules: CurateCon
         if why:
             rejected[name] = why
             continue
-        lo, hi = a.active if rules.trim_idle else (0, a.num_steps)
-        runs = a.operator_runs if rules.dagger_frames == "operator" else [(0, a.num_steps)]
-        pieces = [(max(s, lo), min(e, hi)) for s, e in runs]
-        pieces = [Segment(Path(episodes_dir) / name, s, e) for s, e in pieces if e - s >= MIN_SEGMENT_S * a.fps]
+        pieces = [Segment(Path(episodes_dir) / name, s, e) for s, e in kept_spans(a, rules)]
         if not pieces:
             rejected[name] = "nothing left after trimming"
             continue

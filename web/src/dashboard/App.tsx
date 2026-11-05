@@ -1,27 +1,51 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "../net";
-import { bricksPlaced, drawGoal, levelStates } from "../goal";
-import { type AuditRows, type EpisodeRow, fetchTask, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
+import { drawGoal, levelStates } from "../goal";
+import { type AuditRows, type DatasetRow, type EpisodeEdit, type EpisodeRow, fetchTask, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
+import { EpisodeBrowser, epNumber, REPLAY_SPEEDS, ReplayBar } from "./Episodes";
+import { type Cmd, fmt } from "./util";
 import { Viewer3D, type ViewerHandle } from "./Viewer3D";
 
 type Toast = { id: number; text: string; kind: string };
+type Tab = "record" | "episodes";
+const TAB_KEY = "qc.dash.tab";
+const DATASET_KEY = "qc.dash.dataset";
 
-const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${(s % 60).toFixed(1).padStart(4, "0")}`;
+function savedTab(): Tab {
+  try { return localStorage.getItem(TAB_KEY) === "episodes" ? "episodes" : "record"; } catch { return "record"; }
+}
 
 export function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [online, setOnline] = useState(false);
   const [episodes, setEpisodes] = useState<EpisodeRow[]>([]);
+  const [audit, setAudit] = useState<AuditRows>({});
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [task, setTask] = useState<TaskSpec | null>(null);
+  const [tab, setTab] = useState<Tab>(savedTab);
+  const [selFile, setSelFile] = useState<string | null>(null);
+  const [datasets, setDatasets] = useState<DatasetRow[]>([]);
+  const [dataset, setDataset] = useState<string>(() => { try { return localStorage.getItem(DATASET_KEY) ?? ""; } catch { return ""; } });
   const viewer = useRef<ViewerHandle | null>(null);
   const link = useRef<Link | null>(null);
+  const statusRef = useRef<Status | null>(null);
+  statusRef.current = status;
 
+  // "" = the recording folder. A remembered folder that is gone falls back to it.
+  const ds = datasets.some((d) => d.name === dataset) ? dataset : (datasets.find((d) => d.recording)?.name ?? "");
+  const q = ds ? `?dataset=${encodeURIComponent(ds)}` : "";
   const refreshEpisodes = useCallback(() => {
-    fetch("/api/episodes").then((r) => r.json()).then(setEpisodes).catch(() => {});
+    fetch("/api/datasets").then((r) => r.json()).then(setDatasets).catch(() => {});
+    fetch(`/api/episodes${q}`).then((r) => r.json()).then(setEpisodes).catch(() => {});
+    fetch(`/api/audit${q}`).then((r) => r.json()).then(setAudit).catch(() => {});
+  }, [q]);
+  const pickDataset = useCallback((name: string) => {
+    setEpisodes([]); setAudit({}); setSelFile(null);
+    setDataset(name);
+    try { localStorage.setItem(DATASET_KEY, name); } catch { /* private window */ }
   }, []);
 
-  const toast = useCallback((text: string, kind: string) => {
+  const toast = useCallback((text: string, kind = "info") => {
     const id = Math.random();
     setToasts((t) => [...t, { id, text, kind }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2800);
@@ -40,51 +64,149 @@ export function App() {
       },
     });
     link.current = l;
-    refreshEpisodes();
     return () => l.close();
   }, [refreshEpisodes, toast]);
+  useEffect(refreshEpisodes, [refreshEpisodes]);
 
-  const cmd = useCallback((name: string, args: Record<string, unknown> = {}) => link.current?.command(name, args), []);
+  const cmd: Cmd = useCallback((name, args = {}) => link.current?.command(name, args), []);
 
-  // Keyboard shortcuts.
+  // Newest first, as listed on the Episodes tab.
+  const rows = episodes.slice().reverse();
+  const selected = rows.find((e) => e.file === selFile) ?? null;
+
+  const switchTab = useCallback((t: Tab) => {
+    setTab(t);
+    try { localStorage.setItem(TAB_KEY, t); } catch { /* private window */ }
+  }, []);
+
+  // Episodes tab: the selected episode is loaded as a paused replay; leaving the tab goes back to the live scene.
+  useEffect(() => {
+    if (tab === "record" && statusRef.current?.replay) cmd("replay_stop");
+  }, [tab, cmd]);
+  useEffect(() => {
+    if (tab === "episodes" && !selected && rows.length) setSelFile(rows[0].file);
+  }, [tab, selected, rows]);
+  const idle = status?.rec_state === "idle";  // also (re)loads once the first status arrives or a take ends
+  useEffect(() => {
+    if (tab === "episodes" && selected && idle) cmd("replay", { path: selected.path, paused: true });
+  }, [tab, selected?.path, idle, cmd]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const edit = useCallback(async (e: EpisodeRow, body: EpisodeEdit) => {
+    const r = await fetch(`/api/episodes/${encodeURIComponent(e.file)}${q}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }).catch(() => null);
+    if (!r?.ok) toast("Couldn't save the change", "warn");
+    refreshEpisodes();
+  }, [refreshEpisodes, toast, q]);
+
+  const remove = useCallback(async (e: EpisodeRow) => {
+    if (!confirm(`Delete episode ${epNumber(e.file)} (${e.file})? This can't be undone.`)) return;
+    const r = await fetch(`/api/episodes/${encodeURIComponent(e.file)}`, { method: "DELETE" }).catch(() => null);
+    if (!r?.ok) { toast("Couldn't delete the episode", "warn"); return; }
+    const k = rows.findIndex((x) => x.file === e.file);
+    setSelFile((rows[k + 1] ?? rows[k - 1])?.file ?? null);
+    toast(`Deleted ${epNumber(e.file)}`, "warn");
+    refreshEpisodes();
+  }, [rows, refreshEpisodes, toast]);
+
+  // Keyboard shortcuts (per tab).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === "INPUT" || (e.target as HTMLElement).tagName === "SELECT") return;
-      if (e.code === "Space") { e.preventDefault(); cmd("record_toggle"); }
-      else if (e.key === "s") cmd("save", { success: true });
-      else if (e.key === "f") cmd("save", { success: false });
-      else if (e.key === "d" || e.key === "Backspace") cmd("discard");
-      else if (e.key === "r") cmd("reset");
-      else if (e.key === "c") cmd("recenter");
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (tab === "record") {
+        if (e.code === "Space") { e.preventDefault(); cmd("record_toggle"); }
+        else if (e.key === "s") cmd("save", { success: true });
+        else if (e.key === "f") cmd("save", { success: false });
+        else if (e.key === "d" || e.key === "Backspace") cmd("discard");
+        else if (e.key === "r") cmd("reset");
+        else if (e.key === "c") cmd("recenter");
+        return;
+      }
+      const r = statusRef.current?.replay;
+      const fps = (selected && audit[selected.file]?.fps) || 50;
+      if (e.code === "Space" && selected) {
+        e.preventDefault();
+        if (r) cmd("replay_pause"); else cmd("replay", { path: selected.path });
+      } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && r) {
+        e.preventDefault();
+        cmd("replay_seek", { i: r.i + (e.key === "ArrowLeft" ? -1 : 1) * fps * (e.shiftKey ? 5 : 1) });
+      } else if ((e.key === "," || e.key === ".") && r) {
+        if (!r.paused) cmd("replay_pause", { paused: true });
+        cmd("replay_seek", { i: r.i + (e.key === "," ? -1 : 1) });
+      } else if ((e.key === "[" || e.key === "]") && r) {
+        const k = REPLAY_SPEEDS.findIndex((v) => v >= r.speed - 1e-6);
+        const next = REPLAY_SPEEDS[Math.min(REPLAY_SPEEDS.length - 1, Math.max(0, (k < 0 ? REPLAY_SPEEDS.length - 1 : k) + (e.key === "[" ? -1 : 1)))];
+        cmd("replay_options", { speed: next });
+      } else if ((e.key === "ArrowUp" || e.key === "ArrowDown") && rows.length) {
+        e.preventDefault();
+        const k = rows.findIndex((x) => x.file === selFile);
+        setSelFile(rows[Math.min(rows.length - 1, Math.max(0, k + (e.key === "ArrowUp" ? -1 : 1)))].file);
+      }
     };
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);
-  }, [cmd]);
+  }, [cmd, tab, selected, selFile, rows, audit]);
 
   return (
     <div className="app">
-      <TopBar status={status} online={online} />
-      <main className="grid">
+      <TopBar status={status} online={online} tab={tab} setTab={switchTab}
+        count={datasets.find((d) => d.recording)?.count ?? episodes.length} />
+      <main className={`grid ${tab}`}>
         <section className="col-main">
           <div className="card viewer-card">
-            <div className="card-head">
-              <h2>Live scene</h2>
-              <div className="legend"><i className="dot l" /> left arm <i className="dot r" /> right arm <span className="muted">· dot = grasp point (red: out of reach)</span></div>
-            </div>
             <Viewer3D handle={viewer} />
+            <div className="legend"><i className="dot l" /> left <i className="dot r" /> right</div>
+            {tab === "record" && <Warnings status={status} />}
             <StateOverlay status={status} />
           </div>
+          {tab === "episodes" && <ReplayBar status={status} ep={selected} audit={audit} task={task} cmd={cmd} />}
           <Cameras names={["cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist"]} />
         </section>
         <aside className="col-side">
-          <GoalCard task={task} status={status} />
-          <RecorderCard status={status} cmd={cmd} />
-          <TeleopCard status={status} cmd={cmd} />
-          <EpisodesCard episodes={episodes} status={status} cmd={cmd} refresh={refreshEpisodes} />
+          {tab === "record" ? (
+            <>
+              <RecorderCard status={status} online={online} cmd={cmd} />
+              <GoalCard task={task} status={status} />
+              <TeleopCard status={status} cmd={cmd} />
+            </>
+          ) : (
+            <EpisodeBrowser episodes={episodes} audit={audit} selected={selected} onSelect={(e) => setSelFile(e.file)}
+              onEdit={edit} onDelete={remove} task={task} goRecord={() => switchTab("record")}
+              datasets={datasets} dataset={ds} onDataset={pickDataset} />
+          )}
         </aside>
       </main>
       <div className="toasts">{toasts.map((t) => <div key={t.id} className={`toast ${t.kind}`}>{t.text}</div>)}</div>
     </div>
+  );
+}
+
+function TopBar({ status, online, tab, setTab, count }: {
+  status: Status | null; online: boolean; tab: Tab; setTab: (t: Tab) => void; count: number;
+}) {
+  const quest = !!status?.connected;
+  const recording = status?.rec_state === "recording" || status?.rec_state === "countdown";
+  const health = online ? `Sim ${Math.round(status?.loop_hz ?? 0)} Hz` + (quest && status?.rtt_ms != null ? ` · ${Math.round(status.rtt_ms)} ms` : "") : "";
+  return (
+    <header className="topbar">
+      <div className="brand"><span className="logo">◆</span> QuestCollect</div>
+      <nav className="tabs">
+        <button className={tab === "record" ? "active" : ""} onClick={() => setTab("record")}>
+          <i className={`rec-dot ${recording ? "on" : ""}`} /> Record
+        </button>
+        <button className={tab === "episodes" ? "active" : ""} onClick={() => setTab("episodes")}>
+          Episodes <small>{count}</small>
+        </button>
+      </nav>
+      <div className="chips">
+        <span className={`chip ${online ? "ok" : "bad"}`} title="The QuestCollect server (qc serve)"><i />{online ? "Server" : "Server offline"}</span>
+        <span className={`chip ${quest ? "ok" : "warn"}`} title={quest ? `Input ${Math.round(status?.input_hz ?? 0)} Hz` : "Open the server's address in the Quest Browser and press Enter VR"}>
+          <i />{quest ? "Headset" : "No headset"}
+        </span>
+        {health && <span className={`chip plain ${status && status.loop_hz < 45 ? "warn" : ""}`}>{health}</span>}
+      </div>
+    </header>
   );
 }
 
@@ -126,39 +248,25 @@ function GoalCard({ task, status }: { task: TaskSpec | null; status: Status | nu
   );
 }
 
-function TopBar({ status, online }: { status: Status | null; online: boolean }) {
-  const quest = status?.connected;
-  return (
-    <header className="topbar">
-      <div className="brand"><span className="logo">◆</span> QuestCollect <span className="muted">· bimanual Franka · MuJoCo</span></div>
-      <div className="chips">
-        <Chip label="Server" value={online ? "online" : "offline"} tone={online ? "ok" : "bad"} />
-        <Chip label="Quest" value={quest ? "streaming" : "not connected"} tone={quest ? "ok" : "warn"} />
-        <Chip label="RTT" value={status?.rtt_ms != null ? `${Math.round(status.rtt_ms)} ms` : "—"} tone={status?.rtt_ms != null && status.rtt_ms > 60 ? "warn" : "neutral"} />
-        <Chip label="Input" value={`${Math.round(status?.input_hz ?? 0)} Hz`} />
-        <Chip label="Sim" value={`${Math.round(status?.loop_hz ?? 0)} Hz`} tone={status && status.loop_hz < 45 ? "warn" : "neutral"} />
-      </div>
-    </header>
-  );
-}
-
-function Chip({ label, value, tone = "neutral" }: { label: string; value: string; tone?: string }) {
-  return <div className={`chip ${tone}`}><span>{label}</span><b>{value}</b></div>;
-}
-
 function StateOverlay({ status }: { status: Status | null }) {
   if (!status) return null;
   const st = status.replay ? "replay" : status.rec_state;
-  const label = status.replay ? `REPLAY ${status.replay.i}/${status.replay.n}`
+  const label = status.replay ? `REPLAY${status.replay.speed !== 1 ? ` ${status.replay.speed}×` : ""}${status.replay.paused ? " · paused" : ""}`
     : st === "recording" ? `REC ${fmt(status.elapsed)}`
     : st === "countdown" ? `${Math.ceil(status.countdown)}`
-    : st === "review" ? (status.success_seen ? "SUCCESS · review" : "REVIEW") : "READY";
+    : st === "review" ? (status.success_seen ? "SUCCESS · review" : "REVIEW") : "LIVE";
   return (
     <div className={`state-overlay ${st}`}>
       <i />{label}
       {status.success && st === "recording" && <span className="succ">✓ task solved</span>}
     </div>
   );
+}
+
+function Warnings({ status }: { status: Status | null }) {
+  const w = status?.warnings;
+  const on = [w?.arm_collision && "Arms touching", w?.table_collision && "Arm on the table", w?.ik_saturated && "Target out of reach"].filter(Boolean);
+  return on.length ? <div className="warn-overlay">{on.map((t) => <span key={t as string}>⚠ {t}</span>)}</div> : null;
 }
 
 function Cameras({ names }: { names: string[] }) {
@@ -173,58 +281,82 @@ function Cameras({ names }: { names: string[] }) {
         <figure key={n} className="card cam">
           <img src={`/api/preview/${n}.jpg?t=${tick}`} alt={n} onError={(e) => ((e.target as HTMLImageElement).style.opacity = "0.15")}
             onLoad={(e) => ((e.target as HTMLImageElement).style.opacity = "1")} />
-          <figcaption>{n}</figcaption>
+          <figcaption>{n.replace("cam_", "").replace("_", " ")}</figcaption>
         </figure>
       ))}
     </div>
   );
 }
 
-function RecorderCard({ status, cmd }: { status: Status | null; cmd: (n: string, a?: Record<string, unknown>) => void }) {
+/** What to do next, in one line. */
+function nextStep(s: Status | null, online: boolean): string {
+  if (!online || !s) return "The server is offline. Start it with: uv run qc serve";
+  if (s.rec_state === "countdown") return "Get ready…";
+  if (s.rec_state === "recording") {
+    return s.auto_stop ? "Build the tower. Recording stops by itself 1 s after it's finished." : "Build the tower, then press Stop.";
+  }
+  if (s.rec_state === "review") return "Keep this take? Save it as a success or failure, or discard it.";
+  if (s.replay) return "The scene shows a replay. Starting a recording goes back to the live scene.";
+  if (!s.connected) return "Put on the Quest, open this server's address in the Quest Browser and press Enter VR.";
+  return "Press Start (or Space). In the headset, squeeze Grip to take hold of an arm.";
+}
+
+function RecorderCard({ status, online, cmd }: { status: Status | null; online: boolean; cmd: Cmd }) {
   const s = status;
   const rec = s?.rec_state ?? "idle";
   const [operator, setOperator] = useState("");
   useEffect(() => { if (s && !operator) setOperator(s.operator); }, [s, operator]);
+  const review = s?.review;
   return (
-    <div className="card">
+    <div className={`card recorder ${rec}`}>
       <div className="card-head"><h2>Recorder</h2><span className="muted">{s?.saved_count ?? 0} saved this session</span></div>
-      <label>Operator
-        <input value={operator} onChange={(e) => setOperator(e.target.value)} onBlur={() => cmd("set_operator", { operator })} />
-      </label>
-      <p className="instruction">{s?.instruction}{s && <><br /><b>Tower: {bricksPlaced(s.progress, s.in_area)} / {s.levels + 1} bricks placed</b></>}</p>
-      <button className={`rec-btn ${rec}`} disabled={rec === "review" || !!s?.replay} onClick={() => cmd("record_toggle")}>
+      <button className={`rec-btn ${rec}`} disabled={!online || rec === "review"} onClick={() => cmd("record_toggle")}>
         <i />
-        <span>{rec === "recording" ? `Stop · ${fmt(s!.elapsed)}` : rec === "countdown" ? `Starting in ${Math.ceil(s!.countdown)}…` : rec === "review" ? "Review take" : "Start recording"}</span>
+        <span>{rec === "recording" ? `Stop · ${fmt(s!.elapsed)}` : rec === "countdown" ? `Starting in ${Math.ceil(s!.countdown)}… (cancel)` : rec === "review" ? "Reviewing take" : "Start recording"}</span>
         <kbd>Space</kbd>
       </button>
-      <div className="row3">
-        <button className="btn ok" disabled={rec !== "review" && rec !== "recording"} onClick={() => cmd("save", { success: true })}>✓ Save success <kbd>S</kbd></button>
-        <button className="btn warn" disabled={rec !== "review" && rec !== "recording"} onClick={() => cmd("save", { success: false })}>✗ Save failure <kbd>F</kbd></button>
-        <button className="btn bad" disabled={rec === "idle"} onClick={() => cmd("discard")}>Discard <kbd>D</kbd></button>
-      </div>
-      <div className="row-between">
-        <label className="toggle"><input type="checkbox" checked={s?.auto_stop ?? true} onChange={(e) => cmd("set_auto_stop", { enabled: e.target.checked })} /> Auto-stop 1 s after success</label>
-        <button className="btn ghost" disabled={rec !== "idle"} onClick={() => cmd("reset")}>↺ New scene <kbd>R</kbd></button>
+      <p className="hint">
+        {nextStep(s, online)}
+        {s?.replay && rec === "idle" && <button className="link" onClick={() => cmd("replay_stop")}>Back to live</button>}
+      </p>
+      {review && (
+        <div className={`review ${review.rejected ? "warn" : "ok"}`}>
+          <b>{review.success ? "✓ Tower built" : "✗ Tower not finished"}</b> · {review.duration_s.toFixed(1)} s · idle {review.idle_pct}%
+          <div>{review.rejected ? `Training would skip it: ${review.rejected}` : `Training would use ${review.used_s.toFixed(1)} s of it`}</div>
+        </div>
+      )}
+      {(rec === "review" || rec === "recording") && (
+        <div className="row3">
+          <button className="btn ok" onClick={() => cmd("save", { success: true })}>✓ Success <kbd>S</kbd></button>
+          <button className="btn warn" onClick={() => cmd("save", { success: false })}>✗ Failure <kbd>F</kbd></button>
+          <button className="btn bad" onClick={() => cmd("discard")}>Discard <kbd>D</kbd></button>
+        </div>
+      )}
+      <div className="rec-foot">
+        <input className="operator" title="Operator name, saved in each episode" placeholder="Operator name" value={operator}
+          onChange={(e) => setOperator(e.target.value)} onBlur={() => cmd("set_operator", { operator })} />
+        <label className="toggle" title="Stop recording 1 s after the tower is finished"><input type="checkbox" checked={s?.auto_stop ?? true} onChange={(e) => cmd("set_auto_stop", { enabled: e.target.checked })} /> Auto-stop</label>
+        <button className="btn ghost small" disabled={rec !== "idle"} title="New random brick layout" onClick={() => cmd("reset")}>↺ New scene <kbd>R</kbd></button>
       </div>
     </div>
   );
 }
 
-function TeleopCard({ status, cmd }: { status: Status | null; cmd: (n: string, a?: Record<string, unknown>) => void }) {
+function TeleopCard({ status, cmd }: { status: Status | null; cmd: Cmd }) {
   const s = status;
   return (
     <div className="card">
-      <div className="card-head"><h2>Teleoperation</h2>
-        <button className="btn ghost small" onClick={() => cmd("recenter")}>⟲ Recenter <kbd>C</kbd></button>
+      <div className="card-head"><h2>Arms</h2>
+        <button className="btn ghost small" title="Re-place the table in front of where you stand" onClick={() => cmd("recenter")}>⟲ Recenter <kbd>C</kbd></button>
       </div>
-      <div className="seg">
-        <button className={s?.mode === "controllers" ? "active" : ""} onClick={() => cmd("set_mode", { mode: "controllers" })}>🎮 Controllers</button>
-        <button className={s?.mode === "hands" ? "active" : ""} onClick={() => cmd("set_mode", { mode: "hands" })}>✋ Hand tracking</button>
+      <div className="arms">
+        <ArmTile side="l" status={s} />
+        <ArmTile side="r" status={s} />
       </div>
-      {s?.mode_mismatch && <div className="alert warn">Input source doesn't match the mode — {s.mode === "hands" ? "put the controllers down" : "pick up the controllers"}.</div>}
+      {s?.mode_mismatch && <div className="alert warn">Input doesn't match the mode: {s.mode === "hands" ? "put the controllers down" : "pick up the controllers"}.</div>}
       {s?.control.policy && (
         <>
-          <div className="seg">
+          <div className="seg three">
             {(["teleop", "shared", "policy"] as const).map((m) => (
               <button key={m} className={s.control.mode === m ? "active" : ""} onClick={() => cmd("set_control_mode", { mode: m })}>
                 {{ teleop: "🧑 You drive", shared: "🤝 Shared", policy: "🤖 Policy" }[m]}
@@ -238,18 +370,16 @@ function TeleopCard({ status, cmd }: { status: Status | null; cmd: (n: string, a
           </div>
         </>
       )}
-      <div className="arms">
-        <ArmTile side="l" status={s} />
-        <ArmTile side="r" status={s} />
-      </div>
-      <label className="slider">Motion scale <b>×{(s?.scale ?? 1).toFixed(2)}</b>
-        <input type="range" min={0.25} max={3} step={0.05} value={s?.scale ?? 1} onChange={(e) => cmd("set_scale", { scale: +e.target.value })} />
-      </label>
-      <div className="warnings">
-        <Warn on={!!s?.warnings.arm_collision} text="Arm–arm contact" />
-        <Warn on={!!s?.warnings.table_collision} text="Table contact" />
-        <Warn on={!!s?.warnings.ik_saturated} text="Target out of reach" />
-      </div>
+      <details className="more">
+        <summary>Input {s?.mode === "hands" ? "✋ hands" : "🎮 controllers"} · motion ×{(s?.scale ?? 1).toFixed(2)}</summary>
+        <div className="seg">
+          <button className={s?.mode === "controllers" ? "active" : ""} onClick={() => cmd("set_mode", { mode: "controllers" })}>🎮 Controllers</button>
+          <button className={s?.mode === "hands" ? "active" : ""} onClick={() => cmd("set_mode", { mode: "hands" })}>✋ Hand tracking</button>
+        </div>
+        <label className="slider">Motion scale <b>×{(s?.scale ?? 1).toFixed(2)}</b>
+          <input type="range" min={0.25} max={3} step={0.05} value={s?.scale ?? 1} onChange={(e) => cmd("set_scale", { scale: +e.target.value })} />
+        </label>
+      </details>
     </div>
   );
 }
@@ -259,79 +389,15 @@ function ArmTile({ side, status }: { side: "l" | "r"; status: Status | null }) {
   const tracked = s?.tracked[side], engaged = s?.engaged[side];
   const src = s?.sources[side];
   const grip = s?.grippers[side === "l" ? 0 : 1] ?? 1;
+  const held = s?.held[side];
   return (
     <div className={`arm ${side} ${engaged ? "engaged" : ""} ${tracked ? "tracked" : ""}`}>
       <div className="arm-head">
         <b>{side === "l" ? "Left" : "Right"}</b>
-        <span>{src === SRC_HAND ? "✋ hand" : src === SRC_CONTROLLER ? "🎮 controller" : "∅ none"}</span>
+        <span>{src === SRC_HAND ? "✋" : src === SRC_CONTROLLER ? "🎮" : ""} {engaged ? "moving" : tracked ? "tracked" : "not tracked"}</span>
       </div>
-      <div className="arm-state">{engaged ? "ENGAGED" : tracked ? "tracked" : "not tracked"}</div>
-      <div className="meter"><div style={{ width: `${grip * 100}%` }} /></div>
-      <div className="arm-foot"><span>gripper {Math.round(grip * 100)}%</span><span>IK {s?.ik_error_mm[side] ?? 0} mm</span></div>
-    </div>
-  );
-}
-
-function Warn({ on, text }: { on: boolean; text: string }) {
-  return <span className={`warn-chip ${on ? "on" : ""}`}>{text}</span>;
-}
-
-function EpisodesCard({ episodes, status, cmd, refresh }: {
-  episodes: EpisodeRow[]; status: Status | null; cmd: (n: string, a?: Record<string, unknown>) => void; refresh: () => void;
-}) {
-  const rows = episodes.slice().reverse();
-  const ok = rows.filter((e) => e.success).length;
-  const total = rows.reduce((a, e) => a + (e.duration_s || 0), 0);
-  const [audit, setAudit] = useState<AuditRows>({});
-  const loadAudit = useCallback(() => {
-    fetch("/api/audit").then((r) => r.json()).then(setAudit).catch(() => {});
-  }, []);
-  useEffect(loadAudit, [episodes.length, loadAudit]);
-  const used = rows.filter((e) => audit[e.file] && !audit[e.file].verdict).length;
-  const del = async (p: string) => {
-    if (!confirm(`Delete ${p.split("/").slice(-2).join("/")}?`)) return;
-    await fetch(`/api/episodes?path=${encodeURIComponent(p)}`, { method: "DELETE" });
-    refresh();
-  };
-  const toggleExclude = async (file: string) => {
-    await fetch("/api/curation", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file, exclude: !audit[file]?.excluded, note: "excluded on the dashboard" }),
-    });
-    loadAudit();
-  };
-  return (
-    <div className="card episodes">
-      <div className="card-head"><h2>Dataset</h2><span className="muted">{status?.task.replace(/_/g, " ")}</span></div>
-      <div className="stats">
-        <div><b>{rows.length}</b><span>episodes</span></div>
-        <div><b>{rows.length ? Math.round((100 * ok) / rows.length) : 0}%</b><span>success</span></div>
-        <div><b>{fmt(total)}</b><span>total time</span></div>
-        <div title="Episodes a training dataset would use (qc audit)"><b>{used}</b><span>for training</span></div>
-      </div>
-      <div className="table">
-        {rows.length === 0 && <div className="empty">No episodes yet — record your first demo.</div>}
-        {rows.map((e) => (
-          <div key={e.path} className="tr">
-            <span className={`badge ${e.success ? "ok" : "warn"}`}>{e.success ? "✓" : "✗"}</span>
-            <div className="ep-main">
-              <b>{e.file.replace("episode_", "#").replace(".hdf5", "")}</b>
-              <span className="muted">
-                {e.source === "policy" ? "🤖" : e.input_mode === "hands" ? "✋" : "🎮"} · {e.duration_s?.toFixed(1)} s
-                {audit[e.file] && <> · idle {Math.round(audit[e.file].idle_frac * 100)}%</>}
-              </span>
-            </div>
-            {audit[e.file]?.verdict
-              ? <span className="badge warn" title={audit[e.file].verdict ?? ""}>⚠</span>
-              : audit[e.file] && <span className="badge ok" title="Used for training">✓</span>}
-            <button className="icon" title={audit[e.file]?.excluded ? "Use for training again" : "Exclude from training"}
-              onClick={() => toggleExclude(e.file)}>{audit[e.file]?.excluded ? "↺" : "⊘"}</button>
-            <button className="icon" title="Replay in sim" disabled={status?.rec_state !== "idle"} onClick={() => cmd("replay", { path: e.path })}>▶</button>
-            <button className="icon danger" title="Delete" onClick={() => del(e.path)}>🗑</button>
-          </div>
-        ))}
-      </div>
-      {status?.replay && <button className="btn ghost wide" onClick={() => cmd("replay_stop")}>■ Stop replay</button>}
+      <div className="meter" title={`Gripper ${Math.round(grip * 100)}% open`}><div style={{ width: `${grip * 100}%` }} /></div>
+      <div className="arm-foot"><span>{held ? `holding ${held.replace(/_/g, " ")}` : `gripper ${Math.round(grip * 100)}%`}</span><span title="IK tracking error">{s?.ik_error_mm[side] ?? 0} mm</span></div>
     </div>
   );
 }

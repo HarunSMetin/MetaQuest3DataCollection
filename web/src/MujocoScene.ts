@@ -19,12 +19,15 @@ interface GeomDesc {
   mesh: number | null;
 }
 interface MeshDesc { name: string; vertOffset: number; nvert: number; faceOffset: number; nface: number }
+/** A MuJoCo camera: looks along its -z with +y up (like three.js), vertical field of view in degrees. */
+interface CameraDesc { name: string; body: number; pos: number[]; quat: number[]; fovy: number }
 export interface SceneDesc {
   version: number;
   nbody: number;
   bodies: { id: number; name: string; parent: number }[];
   geoms: GeomDesc[];
   meshes: MeshDesc[];
+  cameras?: CameraDesc[];
 }
 
 interface BufferedFrame { t: number; bodies: Float32Array; flags: number }
@@ -32,9 +35,15 @@ interface BufferedFrame { t: number; bodies: Float32Array; flags: number }
 /** Grasp-point marker (the server's `<arm>_tcp_marker` geom) plus a drop line to the table under it. */
 interface TcpMarker { arm: "l" | "r"; body: THREE.Object3D; sphere: THREE.Mesh; line: THREE.Line; dot: THREE.Mesh }
 
+/** A wrist camera's view: its frustum (on the hand) and the patch of table it sees (outline + faint fill). */
+interface CamViz { body: THREE.Object3D; cam: THREE.Object3D; frustum: THREE.LineSegments; outline: THREE.LineLoop; fill: THREE.Mesh }
+
 const INTERP_DELAY_MS = 30;
 const CREASE_ANGLE = THREE.MathUtils.degToRad(35);
 const OUT_OF_REACH = new THREE.Color("#ef4444");
+const CAM_ASPECT = 4 / 3;      // the recorded images are 320 x 240
+const FRUSTUM_LEN = 0.18;      // m drawn in front of the camera
+const MAX_RAY = 1.5;           // m: a corner ray that doesn't reach the table within this hides the footprint
 
 function gridTexture(): THREE.CanvasTexture {
   const c = document.createElement("canvas");
@@ -66,6 +75,9 @@ export class MujocoScene {
   private outOfReach = { l: false, r: false };
   private bodies: THREE.Object3D[] = [];
   private markers: TcpMarker[] = [];
+  private camViz: CamViz[] = [];
+  private camVizOn = false;
+  private highlighted: { name: string; meshes: THREE.Mesh[]; originals: THREE.Material[]; mat: THREE.MeshStandardMaterial } | null = null;
   private tableZ = 0;
   private frames: BufferedFrame[] = [];
   private clockOffset = Number.POSITIVE_INFINITY;
@@ -182,7 +194,89 @@ export class MujocoScene {
       if (g.name.endsWith("_tcp_marker")) this.addMarker(g.name.startsWith("l_") ? "l" : "r", mesh);
     }
     this.bodies[0].add(this.environment);
+    for (const c of desc.cameras ?? []) {
+      if (c.name.includes("wrist")) this.addCamViz(c, desc.bodies[c.body].name.startsWith("l_") ? ARM_COLORS.l : ARM_COLORS.r);
+    }
     this.frames = [];
+    const want = this.highlighted?.name ?? null;  // the old meshes are gone: highlight the same body again
+    this.highlighted?.mat.dispose();
+    this.highlighted = null;
+    this.highlightBody(want);
+  }
+
+  private addCamViz(c: CameraDesc, color: THREE.Color) {
+    const cam = new THREE.Object3D();
+    cam.position.fromArray(c.pos);
+    cam.quaternion.fromArray(c.quat);
+    const hh = Math.tan(THREE.MathUtils.degToRad(c.fovy) / 2), hw = hh * CAM_ASPECT;
+    cam.userData.corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => new THREE.Vector3(x, y, -1));
+    const L = FRUSTUM_LEN, k = (x: number, y: number) => [x * L, y * L, -L];
+    const [a, b, cc, d] = [k(-hw, -hh), k(hw, -hh), k(hw, hh), k(-hw, hh)];
+    const pts = [[0, 0, 0], a, [0, 0, 0], b, [0, 0, 0], cc, [0, 0, 0], d, a, b, b, cc, cc, d, d, a].flat();
+    const frustumGeo = new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+    const frustum = new THREE.LineSegments(frustumGeo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.7 }));
+    cam.add(frustum);
+    const outlineGeo = new THREE.BufferGeometry().setAttribute("position", new THREE.BufferAttribute(new Float32Array(12), 3));
+    const outline = new THREE.LineLoop(outlineGeo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }));
+    const fillGeo = new THREE.BufferGeometry().setAttribute("position", new THREE.BufferAttribute(new Float32Array(12), 3));
+    fillGeo.setIndex([0, 1, 2, 0, 2, 3]);
+    const fill = new THREE.Mesh(fillGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false }));
+    for (const o of [outline, fill]) { o.frustumCulled = false; this.root.add(o); }
+    this.geometries.push(frustumGeo, outlineGeo, fillGeo);
+    const body = this.bodies[c.body];
+    body.add(cam);
+    this.camViz.push({ body, cam, frustum, outline, fill });
+    this.setCameraViz(this.camVizOn);
+  }
+
+  /** Show where the wrist cameras look: frustum on the hand and the patch of table in view. */
+  setCameraViz(on: boolean) {
+    this.camVizOn = on;
+    for (const v of this.camViz) v.frustum.visible = v.outline.visible = v.fill.visible = on;
+  }
+
+  /** Make one body (e.g. the brick to take next) glow; null clears it. */
+  highlightBody(name: string | null) {
+    if (this.highlighted?.name === name) return;
+    if (this.highlighted) {
+      this.highlighted.meshes.forEach((m, i) => (m.material = this.highlighted!.originals[i]));
+      this.highlighted.mat.dispose();
+      this.highlighted = null;
+    }
+    const body = name ? this.bodies.find((b) => b.name === name) : undefined;
+    const meshes = (body?.children.filter((o) => o instanceof THREE.Mesh) ?? []) as THREE.Mesh[];
+    if (!name || !meshes.length) {
+      if (name) this.highlighted = { name, meshes: [], originals: [], mat: new THREE.MeshStandardMaterial() };  // retried after a reload
+      return;
+    }
+    const mat = (meshes[0].material as THREE.MeshStandardMaterial).clone();
+    mat.emissive.copy(mat.color);
+    this.highlighted = { name, meshes, originals: meshes.map((m) => m.material as THREE.Material), mat };
+    for (const m of meshes) m.material = mat;
+  }
+
+  private updateCamViz() {
+    const p = this.tmpV, q = this.tmpQa, d = new THREE.Vector3(), z = this.tableZ + 0.001;
+    for (const v of this.camViz) {
+      if (!this.camVizOn) continue;
+      p.copy(v.cam.position).applyQuaternion(v.body.quaternion).add(v.body.position);  // bodies are children of root
+      q.copy(v.body.quaternion).multiply(v.cam.quaternion);
+      const hits: THREE.Vector3[] = [];
+      for (const c of v.cam.userData.corners as THREE.Vector3[]) {
+        d.copy(c).applyQuaternion(q);
+        const t = d.z < -1e-6 ? (z - p.z) / d.z : Infinity;
+        if (t * d.length() > MAX_RAY) break;
+        hits.push(p.clone().addScaledVector(d, t));
+      }
+      const show = hits.length === 4;
+      v.outline.visible = v.fill.visible = show;
+      if (!show) continue;
+      for (const o of [v.outline, v.fill]) {
+        const pos = o.geometry.getAttribute("position") as THREE.BufferAttribute;
+        hits.forEach((h, i) => pos.setXYZ(i, h.x, h.y, h.z));
+        pos.needsUpdate = true;
+      }
+    }
   }
 
   private addMarker(arm: "l" | "r", sphere: THREE.Mesh) {
@@ -207,6 +301,11 @@ export class MujocoScene {
 
   private clear() {
     for (const b of this.bodies) this.root.remove(b);
+    for (const v of this.camViz) {
+      this.root.remove(v.outline, v.fill);
+      for (const o of [v.frustum, v.outline, v.fill]) (o.material as THREE.Material).dispose();
+    }
+    this.camViz = [];
     for (const mk of this.markers) {
       this.root.remove(mk.line, mk.dot);
       for (const o of [mk.sphere, mk.line, mk.dot]) (o.material as THREE.Material).dispose();
@@ -258,6 +357,8 @@ export class MujocoScene {
 
     const latest = this.frames[n - 1];
     this.engaged = { l: !!(latest.flags & FLAG_ENGAGED_L), r: !!(latest.flags & FLAG_ENGAGED_R) };
+    if (this.highlighted?.meshes.length) this.highlighted.mat.emissiveIntensity = 0.25 + 0.2 * Math.sin(nowMs / 220);
+    this.updateCamViz();
     for (const mk of this.markers) {
       const color = this.outOfReach[mk.arm] ? OUT_OF_REACH : ARM_COLORS[mk.arm];
       const engaged = this.engaged[mk.arm];

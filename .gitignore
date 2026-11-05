@@ -35,3 +35,6 @@ howToRun.md
 
 # Training runs (qc train / qc eval)
 outputs/
+
+# Compressed old datasets/runs
+archive/

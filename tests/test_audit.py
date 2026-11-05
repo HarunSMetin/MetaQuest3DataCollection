@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from questcollect.audit import audit_dir, audit_episode, select, set_curation, true_runs
+from questcollect.audit import (_without, audit_dir, audit_episode, forget_curation, load_curation, select, set_curation,
+                               true_runs, update_curation)
 from questcollect.config import CurateConfig, load_config
 from questcollect.recorder import SOURCE_POLICY, episode_meta, make_step, teleop_fields, write_episode
 from questcollect.sim import BimanualEnv
@@ -53,9 +54,9 @@ def test_select_applies_rules_and_curation(env, cfg, tmp_path):
     _episode(env, cfg, tmp_path / "episode_000000.hdf5")
     audits = audit_dir(tmp_path)
     assert (tmp_path / "audit.json").exists() and audit_dir(tmp_path) == audits  # second call: from the cache
-    segs, rejected = select(tmp_path, audits, CurateConfig())
+    segs, rejected = select(tmp_path, audits, CurateConfig(cut_contacts=[]))
     assert not segs and "arm link on the table" in rejected["episode_000000.hdf5"]
-    lenient = CurateConfig(max_link_table_frac=0.1)
+    lenient = CurateConfig(max_link_table_frac=0.1, cut_contacts=[])
     segs, _ = select(tmp_path, audits, lenient)
     assert [(s.start, s.stop) for s in segs] == [(20, 80)]
     set_curation(tmp_path, "episode_000000.hdf5", True, "blurry")
@@ -63,6 +64,38 @@ def test_select_applies_rules_and_curation(env, cfg, tmp_path):
     assert rejected["episode_000000.hdf5"] == "excluded by hand: blurry"
     set_curation(tmp_path, "episode_000000.hdf5", False)
     assert select(tmp_path, audits, lenient)[0]
+
+
+def test_manual_labels(env, cfg, tmp_path):
+    """Tags, notes and a success override live in curation.json; the override decides whether a failure is used."""
+    _episode(env, cfg, tmp_path / "episode_000000.hdf5")
+    name, rules = "episode_000000.hdf5", CurateConfig(max_link_table_frac=0.1, cut_contacts=[])
+    update_curation(tmp_path, name, tags=["slow", " clean ", "slow", ""], note="first try")
+    assert load_curation(tmp_path)[name] == {"tags": ["clean", "slow"], "note": "first try"}
+    update_curation(tmp_path, name, success=False)
+    assert select(tmp_path, audit_dir(tmp_path), rules)[1][name] == "failed take"
+    set_curation(tmp_path, name, False)  # including again keeps the tags
+    update_curation(tmp_path, name, success=None, note="")
+    assert load_curation(tmp_path)[name] == {"tags": ["clean", "slow"]} and select(tmp_path, audit_dir(tmp_path), rules)[0]
+    with pytest.raises(ValueError):
+        update_curation(tmp_path, name, rating=5)
+    forget_curation(tmp_path, name)
+    assert load_curation(tmp_path) == {}
+
+
+def test_arm_contact_is_cut_out_with_margin(env, cfg, tmp_path):
+    """The take is kept around an arm-on-table contact instead of being rejected: contact (100, 105) +- 10 steps."""
+    _episode(env, cfg, tmp_path / "episode_000000.hdf5", n=300, moving=(20, 280), link_table=(100, 105))
+    segs, rejected = select(tmp_path, audit_dir(tmp_path), CurateConfig(contact_margin_s=0.2))
+    assert not rejected and [(s.start, s.stop) for s in segs] == [(20, 90), (115, 280)]
+    segs, _ = select(tmp_path, audit_dir(tmp_path), CurateConfig(cut_contacts=[]))
+    assert not segs  # without cutting, the contact limit still applies
+
+
+def test_without_removes_cuts_from_a_span():
+    assert _without((0, 10), [(2, 4), (3, 6), (8, 12)]) == [(0, 2), (6, 8)]
+    assert _without((0, 10), [(-5, 0)]) == [(0, 10)]
+    assert _without((0, 10), [(0, 10)]) == []
 
 
 def test_dagger_keeps_only_operator_steps(env, cfg, tmp_path):

@@ -13,9 +13,11 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from questcollect.audit import audit_dir, load_curation, set_curation, verdict
+from questcollect.audit import (CURATION_FIELDS, audit_dir, forget_curation, kept_spans, labelled_success,
+                               load_curation, update_curation, verdict)
 from questcollect.config import ROOT
 from questcollect.protocol import parse_input
+from questcollect.recorder import episode_files, list_episodes
 from questcollect.runtime import Runtime
 
 log = logging.getLogger(__name__)
@@ -70,38 +72,98 @@ def create_app(runtime: Runtime) -> FastAPI:
     async def status():
         return runtime.status()
 
-    @app.get("/api/episodes")
-    async def episodes():
-        return runtime.episodes()
+    def _dataset_dir(dataset: str | None) -> Path:
+        """An episode folder by name: the recording folder (record.out_dir) by default, else a sibling folder of it
+        (e.g. data/episodes_generated, data/mix_parallel)."""
+        if not dataset or dataset == runtime.cfg.out_dir.name:
+            return runtime.cfg.out_dir
+        name = Path(dataset).name
+        d = runtime.cfg.out_dir.parent / name
+        if not name or name.startswith(".") or not d.is_dir():
+            raise HTTPException(404, "unknown dataset")
+        return d
 
-    @app.delete("/api/episodes")
-    async def delete_episode(path: str):
-        p = Path(path).resolve()
-        out = runtime.cfg.out_dir.resolve()
-        if out not in p.parents or p.suffix != ".hdf5" or not p.exists():
-            raise HTTPException(400, "invalid episode path")
-        p.unlink()
-        return {"deleted": str(p)}
+    def _episode_file(file: str, dataset: str | None = None) -> Path:
+        d = _dataset_dir(dataset)
+        p = d / Path(file).name
+        if p.suffix != ".hdf5" or not p.exists():
+            raise HTTPException(404, "unknown episode")
+        return p
 
-    @app.get("/api/audit")
-    async def audit():
-        """Per episode: contact shares, idle share, and why a training dataset would leave it out (or null)."""
+    @app.get("/api/datasets")
+    async def datasets():
+        """Every episode folder next to the recording folder, recording folder first. Title and description come
+        from an optional dataset.json in the folder."""
         def run():
-            folder = runtime.cfg.out_dir
-            audits = audit_dir(folder)
-            curation = load_curation(folder)
-            return {name: {"contact_frac": a.contact_frac, "idle_frac": a.idle_frac,
-                           "excluded": bool(curation.get(name, {}).get("exclude")),
-                           "verdict": verdict(a, runtime.cfg.curate, curation)} for name, a in audits.items()}
+            rec = runtime.cfg.out_dir
+            folders = [rec] + sorted(d for d in rec.parent.iterdir()
+                                     if d.is_dir() and d != rec and not d.name.startswith("."))
+            out = []
+            for d in folders:
+                files = episode_files(d)
+                if not files and d != rec:
+                    continue
+                info = {}
+                if (d / "dataset.json").exists():
+                    try:
+                        info = json.loads((d / "dataset.json").read_text())
+                    except ValueError:
+                        pass
+                out.append({"name": d.name, "recording": d == rec, "count": len(files),
+                            "title": info.get("title", "Recorded demos" if d == rec else d.name),
+                            "description": info.get("description", "")})
+            return out
         return await asyncio.to_thread(run)
 
-    @app.post("/api/curation")
-    async def curation(body: dict):
-        file = Path(str(body.get("file", ""))).name
-        if not (runtime.cfg.out_dir / file).exists():
-            raise HTTPException(400, "unknown episode")
-        set_curation(runtime.cfg.out_dir, file, bool(body.get("exclude")), str(body.get("note", ""))[:200])
-        return {"ok": True}
+    @app.get("/api/episodes")
+    async def episodes(dataset: str | None = None):
+        """Saved episodes with their manual labels (curation.json): success = the label, recorded_success = as saved."""
+        folder = _dataset_dir(dataset)
+        rows = await asyncio.to_thread(list_episodes, folder)
+        curation = load_curation(folder)
+        for r in rows:
+            c = curation.get(r["file"], {})
+            r.update(recorded_success=r["success"], success=bool(c.get("success", r["success"])),
+                     tags=c.get("tags", []), note=c.get("note", ""), excluded=bool(c.get("exclude")))
+        return rows
+
+    @app.patch("/api/episodes/{file}")
+    async def edit_episode(file: str, body: dict, dataset: str | None = None):
+        """Change an episode's manual labels: any of exclude, note, tags, success (null = as recorded)."""
+        p = _episode_file(file, dataset)
+        fields = {k: v for k, v in body.items() if k in CURATION_FIELDS}
+        if "note" in fields:
+            fields["note"] = str(fields["note"] or "")[:500]
+        return update_curation(p.parent, p.name, **fields)
+
+    @app.delete("/api/episodes/{file}")
+    async def delete_episode(file: str, dataset: str | None = None):
+        if _dataset_dir(dataset) != runtime.cfg.out_dir:  # recorded takes only: derived sets are rebuilt by scripts
+            raise HTTPException(403, "episodes can only be deleted from the recording folder")
+        p = _episode_file(file)
+        if Path((runtime.status().get("replay") or {}).get("path", "")).name == p.name:
+            runtime.command("replay_stop")
+        p.unlink()
+        forget_curation(runtime.cfg.out_dir, p.name)
+        return {"deleted": p.name}
+
+    @app.get("/api/audit")
+    async def audit(dataset: str | None = None):
+        """Per episode: contact shares, idle share, level times, and why a training dataset would leave it out (or
+        null)."""
+        def run():
+            folder = _dataset_dir(dataset)
+            audits = audit_dir(folder)
+            curation = load_curation(folder)
+            rules = runtime.cfg.curate
+
+            def why(a):  # the same reasons as audit.select
+                return verdict(a, rules, curation) or (None if kept_spans(a, rules) else "nothing left after trimming")
+            return {name: {"contact_frac": a.contact_frac, "contact_events": a.contact_events,
+                           "idle_frac": a.idle_frac, "level_times": a.level_times, "fps": a.fps,
+                           "success": labelled_success(a, curation),
+                           "verdict": why(a)} for name, a in audits.items()}
+        return await asyncio.to_thread(run)
 
     @app.post("/api/command")
     async def command(body: dict):

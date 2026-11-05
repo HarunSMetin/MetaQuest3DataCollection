@@ -18,8 +18,11 @@ meta (file attrs): schema_version, task, instruction, operator, input_mode, succ
 /obs/ee_pose_right            (T, 7)
 /obs/objects                  (T, 4, 7)   brick poses, bottom-centre of each brick, order = meta objects
                                           (privileged, sim only)
+/obs/ee_wrench                (T, 2, 6)   external [force N, torque Nm] on each hand, world axes, about the TCP
+                                          (BimanualEnv.ee_wrench; v7+, export recomputes it for older files)
 /action/joint_pos             (T, 16)     [7 L joints, grip L, 7 R joints, grip R]; grip in [0 closed, 1 open]
-/action/ee_pose               (T, 16)     [L xyz qwxyz, R xyz qwxyz, grip L, grip R] IK targets
+/action/ee_pose               (T, 16)     [L xyz qwxyz, R xyz qwxyz, grip L, grip R] TCP pose of the joint
+                                          targets (after the safety filter; v7+, before: the IK targets)
 /sim/state                    (T, S)      mj_getState(mjSTATE_INTEGRATION) before the step, then the 6 clutch
                                           welds' relative poses (6 x 7); BimanualEnv.set_state restores both
 /success                      (T,)        task success predicate per step (tower complete and released)
@@ -36,6 +39,8 @@ meta (file attrs): schema_version, task, instruction, operator, input_mode, succ
 /teleop/{left,right}/pinch    (T, 2)
 /teleop/engaged               (T, 2)
 /teleop/tracked               (T, 2)
+/teleop/assist                (T, 2)      v6 only: grasp assist per arm (0 off, 1 pulling, 2 locked); removed
+                                          in v7, where the action is the operator's target, safety-filtered
 /teleop/rtt_ms                (T,)
 
 Camera images are not stored: sim/state replays the episode exactly, and the exporter re-renders them.
@@ -58,7 +63,7 @@ from questcollect.protocol import InputFrame
 from questcollect.sim import (BRICK_H, BRICKS, CLUTCH_PAIRS, CLUTCH_PRESS_N, CLUTCH_PULL_N, INSTRUCTION, OBJECTS, PITCH,
                               TASK, TOWER)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 AUTO_STOP_TAIL_S = 1.0
 SOURCE_OPERATOR, SOURCE_POLICY = 0, 1
 
@@ -177,6 +182,11 @@ def next_episode_path(out_dir: Path) -> Path:
     return Path(out_dir) / f"episode_{(max(nums) + 1 if nums else 0):06d}.hdf5"
 
 
+def _json_attr(v):
+    """A JSON-valued attribute, whether read_meta already decoded it or not."""
+    return json.loads(v) if isinstance(v, str) else v
+
+
 def list_episodes(out_dir: Path) -> list[dict]:
     rows = []
     for p in episode_files(out_dir):
@@ -189,6 +199,10 @@ def list_episodes(out_dir: Path) -> list[dict]:
             "duration_s": m.get("duration_s"), "num_steps": m.get("num_steps"),
             "input_mode": m.get("input_mode"), "operator": m.get("operator"), "created_at": m.get("created_at"),
             "source": m.get("source", "teleop"),
+            # Derived episodes (scripts/generate_demos.py, qc retime): which file they came from and how.
+            "origin": m.get("retimed_from") or m.get("generated_from"),
+            "generation": _json_attr(m.get("generation")),
+            "retime_moves": len(_json_attr(m["retime_moves"])) if "retime_moves" in m else None,
         })
     return rows
 

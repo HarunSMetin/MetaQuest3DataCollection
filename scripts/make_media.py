@@ -16,8 +16,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from questcollect.config import ROOT, load_config
+from questcollect.frames import mat_to_quat_wxyz
 from questcollect.ik import BimanualIK
-from questcollect.sim import (BRICK_H, BRICKS, LEVELS, STUD_H, BimanualEnv, CameraRenderer, set_brick_pose,
+from questcollect.sim import (BRICK_H, BRICKS, LEVELS, STUD_H, BimanualEnv, CameraRenderer, _rot_z, set_brick_pose,
                               tower_poses)
 
 OUT = ROOT / "docs" / "media"
@@ -49,11 +50,7 @@ DEMO_TOWER = ((0.47, 0.0), 0.0)
 
 def grasp_quat(yaw: float) -> np.ndarray:
     """TCP pointing down with the fingers closing across the brick's y axis (shortest wrist turn)."""
-    yaw = (yaw + np.pi / 2) % np.pi - np.pi / 2
-    qz = np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)])
-    out = np.empty(4)
-    mujoco.mju_mulQuat(out, qz, DOWN)
-    return out
+    return mat_to_quat_wxyz(_rot_z((yaw + np.pi / 2) % np.pi - np.pi / 2) @ np.diag([1.0, -1.0, -1.0]))
 
 
 def tower_keys(env, ik) -> list[tuple]:
