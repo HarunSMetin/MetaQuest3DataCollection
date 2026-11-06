@@ -54,8 +54,9 @@ class RecordConfig(BaseModel):
         default_factory=lambda: ["cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist"]
     )
     operator: str = "operator"
-    action_noise: float = 0.003  # DART: std (rad) of a slow drift on the executed joint targets (~3.5 mm at the TCP);
-                                 # the clean target is recorded
+    action_noise: float = 0.0  # DART: std (rad) of a slow drift on the executed joint targets (0.003 ~ 3.5 mm at the
+                               # TCP); the clean target is recorded. Off by default: the drift is as large as the stud
+                               # tolerance, and the operator's own imprecision already gives corrections
 
 
 class ServerConfig(BaseModel):
@@ -77,6 +78,10 @@ class CurateConfig(BaseModel):
     contact_margin_s: float = 0.2      # also cut this long before and after each contact
     trim_idle: bool = True             # drop the still start and end of each episode
     dagger_frames: Literal["operator", "all"] = "operator"  # shared-control takes: only the operator's steps
+    # Train on the start of the task only: end each take this long after tower level `until_level` clicked
+    # (1 = the second brick on the base); takes that never get there are left out. None = the whole take.
+    until_level: int | None = None
+    until_level_tail_s: float = 1.0
 
 
 class LearnConfig(BaseModel):

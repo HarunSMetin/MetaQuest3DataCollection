@@ -225,8 +225,14 @@ def _without(span: tuple[int, int], cuts: list[tuple[int, int]]) -> list[tuple[i
 
 def kept_spans(a: EpisodeAudit, rules: CurateConfig) -> list[tuple[int, int]]:
     """[start, stop) of the steps of an accepted take that go into a dataset: idle ends trimmed, only the
-    operator's steps of a shared-control take, cut contacts removed, pieces shorter than MIN_SEGMENT_S dropped."""
+    operator's steps of a shared-control take, cut contacts removed, pieces shorter than MIN_SEGMENT_S dropped;
+    with rules.until_level, only up to just after that tower level clicked."""
     lo, hi = a.active if rules.trim_idle else (0, a.num_steps)
+    if rules.until_level is not None:
+        t = a.level_times[rules.until_level - 1] if rules.until_level <= len(a.level_times) else None
+        if t is None:
+            return []
+        hi = min(hi, round((t + rules.until_level_tail_s) * a.fps))
     runs = a.operator_runs if rules.dagger_frames == "operator" else [(0, a.num_steps)]
     margin = round(rules.contact_margin_s * a.fps)
     cuts = [(max(0, s - margin), e + margin) for kind in rules.cut_contacts for s, e in a.contact_runs.get(kind, [])]

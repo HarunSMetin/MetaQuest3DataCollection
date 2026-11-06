@@ -30,12 +30,14 @@ from questcollect.ik import BimanualIK
 from questcollect.recorder import (AUTO_STOP_TAIL_S, SOURCE_OPERATOR, episode_meta, make_step, read_episode,
                                    teleop_fields, write_episode)
 from questcollect.sim import (ARM_CLEAR_M, ARMS, BRICKS, CAM_CLEAR_M, SPAWN, SPAWN_JITTER_M, SPAWN_YAW, ArmClearance,
-                              BimanualEnv, _quat_yaw, env_from_episode, set_brick_pose)
+                              BimanualEnv, _quat_yaw, env_from_episode, executed_actions, held_bricks,
+                              set_brick_pose)
 
 PRE_S = 1.5        # pick window starts this long before the gripper closes (the final descent)
 PLACE_M = 0.03     # place window starts when the source brick is within this of its final xy
 POST_S = 0.6       # windows extend this long past the gripper opening (lift-off)
 FREEZE_Z = 0.008   # the in-hand correction is followed until the brick is this close above its seat, then frozen
+MAX_CORRECTION_M = 0.03  # in-hand corrections larger than this are not applied
 EXTRA_S = 3.0      # time allowed past the end of the commands for the tower to finish and settle
 CLEAR_TOL_M = 0.005  # where the source itself came closer than ARM/CAM_CLEAR_M, a take may come this much closer
 CONTACT_TOL = 5    # steps of arm-arm / arm-on-table contact allowed beyond the source's
@@ -104,6 +106,12 @@ def _blend(fa, fb, pose7, s):
     return p, q / np.linalg.norm(q)
 
 
+def _lerp(a: np.ndarray, f: float) -> np.ndarray:
+    i = min(int(np.floor(f)), len(a) - 1)
+    j = min(i + 1, len(a) - 1)
+    return a[i] + (a[j] - a[i]) * (f - i)
+
+
 def _smooth(s):
     s = np.clip(s, 0, 1)
     return s * s * (3 - 2 * s)
@@ -144,15 +152,25 @@ class Take:
 
 
 def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray] | None = None,
-           spawn: dict | None = None, d_tower: float = 0.0, d_base=(0.0, 0.0), arm_start: dict | None = None) -> Take:
+           spawn: dict | None = None, d_tower: float = 0.0, d_base=(0.0, 0.0), arm_start: dict | None = None,
+           joints: bool = False) -> Take:
     """Play a source take (data from read_episode with KEYS) from its first state, adapted (module docstring).
     frames: per arm the source frame to play at each new step (default: as recorded); spawn: brick name ->
     (xy, yaw) start; d_tower (rad) / d_base (m, xy): turn/shift of the tower about the source's base; arm_start:
-    arm -> TCP pose [x y z qw qx qy qz] to start from."""
+    arm -> TCP pose [x y z qw qx qy qz] to start from.
+    joints: play each arm's recorded joint targets at its frame instead (no IK, no adaptation). Exact for the
+    source's own timing; for a retimed take (same layout, each arm's moves in order) the scene mostly evolves as
+    recorded, and the IK path's small tracking errors (p99 7-40 mm while pressing) can't grow into a missed brick.
+    Not with spawn / d_tower / d_base / arm_start, which need the IK."""
+    if joints and (spawn or d_tower or np.any(d_base) or arm_start):
+        raise ValueError("joints=True replays the recorded layout only")
     n = len(data["action/joint_pos"])
     frames = frames or {a: np.arange(n) for a in ARMS}
     length = max(len(f) for f in frames.values())
-    frame = {a: lambda t, a=a: int(frames[a][min(t, len(frames[a]) - 1)]) for a in ARMS}
+    # frames may be fractional (retime eases into and out of a staging hold): the joint targets are then
+    # interpolated; everything else (IK targets, grippers, teleop fields) uses the nearest frame.
+    ffr = {a: lambda t, a=a: float(frames[a][min(t, len(frames[a]) - 1)]) for a in ARMS}
+    frame = {a: lambda t, a=a: int(round(ffr[a](t))) for a in ARMS}
     ob = data["obs/objects"]
     d_base = np.asarray(d_base, float)
     cyc = cycles(data, fps)
@@ -222,10 +240,15 @@ def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray]
             X = planar(ob[f, REF[i], :2], _quat_yaw(ob[f, REF[i], 3:]), cur.xpos[:2], _quat_yaw(cur.xquat))
         if D is not None:
             return Xf(X, D)
+        if now["held"].get(a) != i:  # the brick isn't in this hand (dropped, or not grasped yet): no correction,
+            return Xf(X, np.eye(4))  # else hand⁻¹·brick over a long lever turns into a jump of the target
         H_src = np.linalg.inv(mat(ee_meas[a][f])) @ mat(ob[f, i])
         o = now["obs"]
         H_new = np.linalg.inv(mat(o["ee_pose_left" if a == "l" else "ee_pose_right"])) @ mat(o["objects"][i])
-        return Xf(X, H_src @ np.linalg.inv(H_new))
+        D = H_src @ np.linalg.inv(H_new)
+        if np.linalg.norm(D[:3, 3]) > MAX_CORRECTION_M:  # the brick sits far off how it sat in the source hand:
+            D = np.eye(4)                                 # a correction this large would throw the arm
+        return Xf(X, D)
 
     def target(a, f):
         pose = ee_src[a][f]
@@ -245,20 +268,27 @@ def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray]
         return _blend(prev_T, Xf(), pose, progress_s(a, prev_end, n - 1, f))
 
     grips = data["action/joint_pos"][:, [7, 15]]
+    src_q = data["action/joint_pos"]
     eng = data["teleop/engaged"]
     take = Take()
     tail, run = round(AUTO_STOP_TAIL_S * fps), 0
     for t in range(length + round(EXTRA_S * fps)):
         obs, state, flags = env.observe(), env.get_state(), env.contact_flags()
         now["obs"] = obs
+        if not joints:
+            now["held"] = held_bricks(env.model, env.data)
         f = {a: frame[a](t) for a in ARMS}
-        ee = []
-        for a in ARMS:
-            p, q = target(a, f[a])
-            ik.set_target(a, p, q)
-            ee.append(np.r_[p, q])
-        ik.follow(env.data.qpos[env.arm_qadr])
-        q_t = ik.solve()
+        if joints:
+            q_t = np.r_[_lerp(src_q[:, 0:7], ffr["l"](t)), _lerp(src_q[:, 8:15], ffr["r"](t))]
+            ee = [ee_src["l"][f["l"]], ee_src["r"][f["r"]]]
+        else:
+            ee = []
+            for a in ARMS:
+                p, q = target(a, f[a])
+                ik.set_target(a, p, q)
+                ee.append(np.r_[p, q])
+            ik.follow(env.data.qpos[env.arm_qadr])
+            q_t = ik.solve()
         g = np.array([grips[f["l"], 0], grips[f["r"], 1]])
         env.apply_action(q_t, g)
         ok = env.success()
@@ -326,6 +356,7 @@ def generate(src: Path, seed: int, out_dir: Path | None, identity: bool = False,
     meta, data = read_episode(src, keys=KEYS)
     fps = int(meta["fps"])
     env = env_from_episode(meta)
+    data = executed_actions(env, data)  # the targets that built the tower, not the operator's before the DART drift
     rng = np.random.default_rng(seed)
     spawn = {b.name: (np.asarray(SPAWN[b.name]) + rng.uniform(-jitter, jitter, 2), rng.uniform(-spawn_yaw, spawn_yaw))
              for b in BRICKS}

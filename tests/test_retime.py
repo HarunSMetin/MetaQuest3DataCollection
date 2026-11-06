@@ -96,3 +96,69 @@ def test_recorded_actions_replay_exactly(tmp_path):
         env.step()
         assert np.array_equal(env.get_state(), S[t + 1]), t
     assert pytest.approx(d["action/joint_pos"][-1, 7], abs=1e-6) == 1.0 - 79 / 80
+
+
+def test_staging_splits_a_move_before_the_tower_zone():
+    # left: one 4 s move whose last second is at the tower; it slows down 0.6 s before entering the zone
+    n = 260
+    t = np.arange(n) / FPS
+    left = np.where(t < 0.2, 0.0, np.minimum(t - 0.2, 4.0)) * 0.5
+    s = _streams(left, np.zeros(n))
+    x = np.linspace(1.0, 0.0, n)
+    x[150:160] = x[150]  # the hand nearly stops here (the staging pose)
+    s.ee["l"][:, 0] = x
+    s.ee["l"][:, 1] = 0.0
+    s.ee["l"][205:, :2] = 0.0  # in the zone from frame 205 on
+    plain = [m for m in _moves(s, np.zeros(2), FPS) if m.arm == "l"]
+    staged = [m for m in _moves(s, np.zeros(2), FPS, stage=True) if m.arm == "l"]
+    assert len(plain) == 1 and plain[0].zone
+    approach, zone = staged
+    assert approach.e == zone.s and 150 <= approach.e <= 160 and not approach.zone and approach.staged
+    assert zone.zone and zone.zone_s == 205 and zone.e == plain[0].e and zone.staged
+
+
+def test_easing_slows_into_and_out_of_a_staging_wait():
+    tl = _Timeline(100)
+    tl.items = [(0, Move("l", 0, 40, staged=True)), (70, Move("l", 40, 100, 50, 100, staged=True))]
+    raw, eased = tl.indices(130), tl.indices(130, ease=5)
+    assert raw[40:70].tolist() == [39] * 30  # waits at the staging frame
+    v = np.diff(eased)
+    assert np.all(v >= -1e-9) and np.abs(np.diff(v)).max() <= 1 / 11 + 1e-9  # monotonic, no jump in speed
+    assert np.array_equal(eased[:30], raw[:30]) and np.array_equal(eased[80:], raw[80:])
+
+
+def test_joint_replay_reproduces_the_source():
+    """generate.replay(joints=True) with the source's own timing is the recorded take."""
+    from questcollect import generate
+
+    cfg = load_config()
+    env = BimanualEnv(cfg)
+    env.reset(seed=4)
+    q0 = env.data.qpos[env.arm_qadr].copy()
+    steps = []
+    for k in range(60):
+        q = q0 + np.r_[np.full(7, 0.002 * k), np.zeros(7)]
+        obs, state, flags = env.observe(), env.get_state(), env.contact_flags()
+        env.apply_action(q, np.ones(2))
+        steps.append(make_step(env, obs, state, q, np.ones(2), [np.r_[0, 0, 0, 1, 0, 0, 0]] * 2, False, 0, flags,
+                               teleop_fields(None)))
+        env.step()
+    data = {k: np.array([v for v in vals]) for k, vals in _flat(steps).items()}
+    env.reset(seed=4)
+    take = generate.replay(env, data, FPS, joints=True)
+    for t in range(59):
+        assert np.array_equal(take.steps[t]["sim"]["state"], data["sim/state"][t]), t
+
+
+def _flat(steps):
+    out = {"sim/state": [], "action/joint_pos": [], "action/ee_pose": [], "obs/joint_pos": [],
+           "obs/ee_pose_left": [], "obs/ee_pose_right": [], "obs/objects": [], "teleop/engaged": [], "contacts": []}
+    for s in steps:
+        out["sim/state"].append(s["sim"]["state"])
+        out["action/joint_pos"].append(s["action"]["joint_pos"])
+        out["action/ee_pose"].append(s["action"]["ee_pose"])
+        for k in ("joint_pos", "ee_pose_left", "ee_pose_right", "objects"):
+            out[f"obs/{k}"].append(s["obs"][k])
+        out["teleop/engaged"].append([True, True])
+        out["contacts"].append(s["contacts"])
+    return out

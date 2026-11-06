@@ -833,6 +833,19 @@ def load_recorded_model(xml: str) -> mujoco.MjModel:
     return mujoco.MjModel.from_xml_string(xml, assets)
 
 
+def executed_actions(env: BimanualEnv, data: dict) -> dict:
+    """data with action/joint_pos and action/ee_pose replaced by the targets actually sent (DART drift included;
+    the grippers carry no drift). The recorded ones are the operator's targets before the drift, which the operator
+    only partly corrects for: near a click they are ~2 mm (std) off where the brick was actually seated.
+    Used by the export (learn.action_label: executed) and by generate/retime, which replay a take's TCP targets."""
+    q = env.executed_targets(data["sim/state"])
+    joint = data["action/joint_pos"].copy()
+    joint[:, :7], joint[:, 8:15] = q[:, :7], q[:, 7:]
+    ee = data["action/ee_pose"].copy()
+    ee[:, :14] = env.tcp_poses_at(q).reshape(len(q), 14)
+    return {**data, "action/joint_pos": joint, "action/ee_pose": ee}
+
+
 def env_from_episode(meta: dict) -> BimanualEnv:
     """The environment an episode was recorded in: built from its saved config (not today's config.yaml), and
     checked against its saved scene fingerprint (`env.scene_matches`; a mismatch is logged)."""

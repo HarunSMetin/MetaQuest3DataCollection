@@ -111,3 +111,15 @@ def test_old_episodes_are_replayed_for_contacts(env, cfg, tmp_path):
     """Episodes from before schema v5 have no `contacts`: the audit replays sim/state instead."""
     a = audit_episode(_episode(env, cfg, tmp_path / "episode_000000.hdf5", with_contacts=False))
     assert a.contact_frac == {"link_table": 0.0, "arm_arm": 0.0, "tip_table": 0.0}  # arms at home, clear of all
+
+
+def test_until_level_ends_takes_after_that_click():
+    from questcollect.audit import EpisodeAudit, kept_spans
+    a = EpisodeAudit(file="x", num_steps=3000, fps=50, success=True,
+                     contact_frac={k: 0.0 for k in ("link_table", "arm_arm", "tip_table")},
+                     contact_events={k: 0 for k in ("link_table", "arm_arm", "tip_table")}, idle_frac=0.0,
+                     active=(10, 2990), level_times=[20.0, 40.0, 55.0], operator_runs=[(0, 3000)], contact_runs={})
+    assert kept_spans(a, CurateConfig()) == [(10, 2990)]
+    assert kept_spans(a, CurateConfig(until_level=1)) == [(10, 1050)]  # 20 s + 1 s tail
+    a.level_times = [None, None, None]
+    assert kept_spans(a, CurateConfig(until_level=1)) == []

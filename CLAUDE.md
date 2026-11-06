@@ -27,6 +27,7 @@ uv run qc export <name> [--randomize-visuals]          # -> data/lerobot/<name> 
 uv run qc train <dataset> [--preset act_240] [--dry-run] [--key=value ...]   # -> outputs/<run>/train
 uv run qc eval outputs/<run> [--n 50] [--ensemble 0.01]   # -> outputs/<run>/eval/<time>/metrics.json
 uv run qc serve --policy outputs/<run> [--control shared|policy]
+MUJOCO_GL=egl uv run --extra learn python scripts/check_pipeline.py [--config <cfg>] [--dataset <name>]  # before training: data == eval world
 
 uv run --group dev pytest                                   # all tests
 uv run --group dev pytest tests/test_teleop.py::test_protocol_roundtrip   # single test
@@ -136,8 +137,12 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   brick it goes onto *as it is now* plus an in-hand correction (towers slide a few mm under the press, so replaying
   recorded joints after any change misses), optionally new layouts / per-arm time maps. `generate.check` accepts a
   take (tower built, no new contacts, `sim.ArmClearance`: arms `ARM_CLEAR_M` / wrist cameras `CAM_CLEAR_M` apart,
-  or as close as the source came). Retime schedules whole moves (never split mid-motion) as early as clearance, the
-  one-arm tower zone and gripper settle times allow, then replays and checks; failures delay moves and retry.
+  or as close as the source came). Retime schedules moves as early as clearance, the
+  one-arm tower zone and gripper settle times allow (staging: a move into the zone is split just outside it, so the
+  waiting arm carries its brick there, eases into a wait and places when the other arm lifts off), then replays
+  with `generate.replay(joints=True)` (each arm's own recorded joints; the IK path lets small tracking errors
+  grow into missed bricks and its in-hand correction is only applied while the brick is held), else the IK path,
+  and checks; failures delay moves and retry.
   Recorded `action/joint_pos` still replays bit-exactly from `sim/state[0]` (`test_recorded_actions_replay_exactly`).
 - **Replaying recorded episodes**: use `sim.env_from_episode(meta)` (episode's own config + `scene_hash` check), not
   `BimanualEnv(load_config())`. `scene_hash` is computed from the saved MJCF via `load_recorded_model` (the compiled

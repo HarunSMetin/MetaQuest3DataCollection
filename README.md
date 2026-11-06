@@ -384,10 +384,14 @@ are left out; the still start and end of each take are trimmed; failed takes are
 Your episode files are never changed.
 
 **Optional, experimental: retime.** With one operator, one arm often waits while the other works, and a policy
-learns to wait too. `qc retime` reschedules a take so both arms work at once: each move of an arm (never cut in
-half) starts as soon as the other arm is out of the way. Only one arm at a time works at the tower, in the
+learns to wait too. `qc retime` reschedules a take so both arms work at once: each move of an arm starts as soon as
+the other arm is out of the way, and an arm that has to wait for the tower carries its brick to a staging pose
+just outside the tower zone (the slowest point of your own approach there), slows into it and waits until the
+other arm lifts off, then places; meanwhile the other arm already reaches for its next brick (`--no-stage`: the
+waiting arm only starts its whole move later). Only one arm at a time works at the tower, in the
 recorded order; the arms stay 2 cm and the wrist cameras 4 cm from the other arm (or as close as your take came,
-never closer), so a wrist camera never films the inside of the other arm. The take is then re-simulated, each
+never closer), so a wrist camera never films the inside of the other arm. The take is then re-simulated, first with
+each arm's own recorded joint targets on its new timeline (your motion exactly), else through the IK with each
 brick placed where the tower really is, and kept only if the tower gets built with no new contacts. Typical
 result: about 25% shorter, both arms moving at once about 30% of the time. The results go to a separate folder
 (your episodes are not changed); export them like any other folder:
@@ -432,7 +436,8 @@ The `act_240` preset is [ACT](https://tonyzhaozh.github.io/aloha/) (action chunk
 6 GB laptop GPU (RTX 4050): batch 16, mixed precision, ~3.6 GB of GPU memory, ~8 hours for 100k steps.
 `--preset dp_240` is [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) (CNN U-Net, 64-step horizon,
 re-planned every 16 steps, DDIM): batch 32, ~5.1 GB, ~9.5 hours for 80k steps. Why these settings, and the
-results so far: [experiments/diffusion/README.md](experiments/diffusion/README.md).
+results so far: [experiments/diffusion/README.md](experiments/diffusion/README.md). `dp_240_pre` is the same with
+an ImageNet-pretrained ResNet18 image encoder (`dp_240` learns it from scratch).
 
 **4. Evaluate.** Runs the policy in the simulator on 50 fixed scenes it never saw, as fast as the PC allows:
 
@@ -471,7 +476,7 @@ Teleoperation card switches between *You drive*, *Shared* and *Policy*.
 | Layer | What it does |
 | --- | --- |
 | Clean data | `qc audit` leaves out takes where an arm rested on the table, the arms touched, or the hand dragged along the table. |
-| Recovery data | DAgger corrections (above), and `record.action_noise` (DART, on by default): while you record, the arm you are moving drifts a few mm off what you command, slowly, and you correct it without thinking; the data shows the correction. A released arm stays still. |
+| Recovery data | DAgger corrections (above), and optionally `record.action_noise` (DART, off by default): while you record, the arm you are moving drifts a few mm off what you command, slowly, and you correct it; the data shows the correction. A released arm stays still. Off because 0.003 rad (~2 mm at the gripper near a click) is as large as the stud tolerance and comes on top of the hand's own error; DAgger gives corrections from the policy's real mistakes instead. |
 | Safety filter | Every action, the operator's and a policy's, passes [questcollect/safety.py](questcollect/safety.py): it changes the joint targets as little as possible so the arms stay ≥ 2 cm apart, links 1 cm and fingertips 5 mm above the table. |
 
 ## What gets recorded
@@ -659,12 +664,12 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | `record.countdown_s` | 3 | countdown before recording starts (s) |
 | `record.cameras` | the four cameras | camera previews on the dashboard |
 | `record.operator` | `operator` | default operator name stored in episodes |
-| `record.action_noise` | 0.003 | DART: a slow drift (rad, std; ~3.5 mm at the gripper) on the executed joint targets while you record; the clean target is recorded. 0 = off |
+| `record.action_noise` | 0 | DART: a slow drift (rad, std; ~3.5 mm at the gripper) on the executed joint targets while you record; the clean target is recorded. 0 = off |
 | `server.host`, `port`, `https_port`, `cert_dir` | 0.0.0.0, 8000, 8443, `certs` | network address, ports and certificate folder |
-| `curate.*` | | which episodes and steps training uses: contact limits, `cut_contacts` + `contact_margin_s` (arm-on-table or arm-arm moments are cut out, the rest of the take is kept), `trim_idle`, `include_failures`, `dagger_frames` |
+| `curate.*` | | which episodes and steps training uses: contact limits, `cut_contacts` + `contact_margin_s` (arm-on-table or arm-arm moments are cut out, the rest of the take is kept), `trim_idle`, `include_failures`, `dagger_frames`, `until_level` (+ `until_level_tail_s`: train on each take only until that tower level clicked) |
 | `learn.cameras`, `image_size`, `action`, `env_state`, `joint_vel`, `ee_wrench`, `action_label` | 3 cameras, 240×320, joint, false, true, true, executed | what a policy sees and outputs; `action_label`: train on the targets actually sent (`executed`, DART drift included) or the operator's before the drift (`recorded`) |
 | `learn.datasets_dir`, `runs_dir` | `data/lerobot`, `outputs` | where datasets and training runs go |
-| `learn.presets` | `act_240`, `dp_240` | named lerobot-train settings for `qc train --preset` |
+| `learn.presets` | `act_240`, `dp_240`, `dp_240_pre` | named lerobot-train settings for `qc train --preset` |
 | `safety.enabled`, `arm_margin`, `table_margin`, `finger_table_margin` | true, 0.02, 0.01, 0.005 | the safety filter on every action, teleop and policy: distances it keeps between the arms, arm links and the table, fingertips and the table (m) |
 | `control.mode`, `policy`, `n_action_steps` | teleop, none, 10 | who drives in `qc serve`, and how often a live policy is asked |
 

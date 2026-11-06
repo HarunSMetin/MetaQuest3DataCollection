@@ -223,6 +223,8 @@ def retime(
     config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
     jobs: int = typer.Option(min(6, max(1, (os.cpu_count() or 2) - 1)),
                              help="Episodes simulated in parallel (~0.8 GB each)"),
+    stage: bool = typer.Option(True, help="Let a waiting arm carry its brick to a staging pose beside the tower "
+                                          "and wait there (else it only starts its whole move later)"),
 ):
     """Experimental: reschedule takes so both arms work at once (one arm at the tower at a time, clearance between
     the arms and their wrist cameras), re-simulate, keep what still builds the tower. Source episodes are not
@@ -237,7 +239,7 @@ def retime(
     out = out if out.is_absolute() else ROOT / out
     total_before = total_after = 0
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        futures = {pool.submit(retime_episode, f, out): f for f in files}
+        futures = {pool.submit(retime_episode, f, out, stage): f for f in files}
         for fut, f in futures.items():
             try:
                 r = fut.result()
@@ -249,6 +251,7 @@ def retime(
             typer.echo(f"  {f.name}: {r.steps_before / r.fps:6.1f}s -> {r.steps_after / r.fps:6.1f}s "
                        f"({r.saved_frac:4.0%} shorter), {len(r.moves)} moves earlier, {r.rejected} retries"
                        + (f", closest arms {c['arm_m'] * 100:.1f} cm, camera {c['cam_m'] * 100:.1f} cm" if c else "")
+                       + (f", {r.mode}" if r.mode else "")
                        + ("" if r.path else "  (no shorter schedule, not written)"))
     if total_before:
         typer.secho(f"\n{1 - total_after / total_before:.0%} shorter overall -> {out}", fg="green")

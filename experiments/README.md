@@ -12,7 +12,7 @@ a preset in `config.yaml` (`learn.presets`) plus a note here. Run one with
 | 2026-11-02 | `20261031-2200_act_240_tower_v2` | tower_v2: 108 retimed, generated | ACT `act_240` | 0/50, 0/50 (ensemble) | picks and carries; placement 6–8 mm off ([below](#act-on-tower_v2)) |
 | 2026-11-02 | `20261102-0505_dp_240_tower_v2` | tower_v2 | Diffusion `dp_240` | 0/50 | base in area 48%, level 1 4%; the blue brick is never lifted in 29/50 ([diffusion/](diffusion/README.md)) |
 | 2026-11-03 | `20261103-0116_dp_state_tower_v2_state` | tower_v2_state | Diffusion `dp_state`, brick poses instead of cameras | 0/50 | level 1 22% (cameras: 0–4%), still 7 mm off; action side is the larger bottleneck ([state_oracle/](state_oracle/README.md)) |
-| 2026-11-06 | `*_dp_240_tower_v3` | tower_v3: 71 unassisted hand demos (DART on), executed-target labels | Diffusion `dp_240`, joint actions + joint_vel + hand wrench | (running) | [tower_v3/](tower_v3/README.md) |
+| 2026-11-06 | `20261106-0108_dp_240_tower_v3` | tower_v3: 71 unassisted hand demos (DART on), executed-target labels | Diffusion `dp_240`, joint actions + joint_vel + hand wrench | (running) | [tower_v3/](tower_v3/README.md) |
 
 ### ACT on tower_v2
 
