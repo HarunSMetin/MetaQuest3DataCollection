@@ -7,8 +7,17 @@ a fresh chunk of n_action_steps targets, and compare them with the targets the d
 (executed labels, as in training), converted to TCP positions by forward kinematics. Frames are grouped by phase:
 `grasp` = the last 0.6 s before a brick lifts off, `place` = the last 0.6 s before a level clicks, `other`.
 
-Small error on the training episodes and large closed-loop error = compounding (fix: corrections / DAgger).
-Large error already here = the model does not fit the demos to the millimetre (fix: model / action representation).
+Two trivial predictors are scored on the same frames, because a small error alone says little: the arm's motion is
+smooth, so the next 0.3 s of targets follow from the current motion without knowing the task.
+  `coast`  = measured joints + LAG_S x measured joint velocity, continued at that velocity (in the demos the target
+             leads the measured joints by ~0.12 s of motion: R^2 0.96-0.99, experiments/REVIEW_2026-11-12.md)
+  `repeat` = the previous step's target, held
+A policy only shows that it knows where to go where it beats `coast`; in a slow phase (the last descent onto the
+studs) `coast` is at 0.1-0.5 mm and the open-loop error cannot tell a good policy from a bad one. What the closed
+loop does with the error is measured by scripts/drift_test.py.
+
+Large error already here = the model does not fit the demos to the millimetre (fix: model / action representation /
+more epochs). Small error here and failing rollouts = look at drift_test.py before concluding "covariate shift".
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from questcollect.recorder import read_episode  # noqa: E402
 from questcollect.sim import executed_actions, env_from_episode  # noqa: E402
 
 WINDOW = 30  # 0.6 s at 50 Hz
+LAG_S = 0.12  # the joint targets lead the measured joints by this much motion (PD tracking lag, measured)
 
 
 def phases(data, stop):
@@ -51,12 +61,17 @@ def main():
     ap.add_argument("--every", type=int, default=40, help="also sample every this many steps")
     ap.add_argument("--level", type=int, default=1, help="stop each episode 1 s after this level clicked")
     ap.add_argument("--glob", default="episode_*.hdf5")
+    ap.add_argument("--config", default=str(ROOT / "experiments/two_bricks/config.yaml"))
+    ap.add_argument("--steps", type=int, default=None, help="compare this many steps of each predicted chunk "
+                                                            "(default: n_action_steps as trained)")
     args = ap.parse_args()
-    cfg = load_config(ROOT / "experiments/two_bricks/config.yaml")
-    runner = PolicyRunner(Path(args.run), cfg)
+    cfg = load_config(args.config)
+    runner = PolicyRunner(Path(args.run), cfg, n_action_steps=args.steps)
     k = runner.policy.config.n_action_steps
+    dt = 1.0 / cfg.sim.control_hz
     files = sorted(Path(args.episodes).glob(args.glob))[: args.n]
     err = {"grasp": [], "place": [], "other": []}
+    base = {"coast": {n: [] for n in err}, "repeat": {n: [] for n in err}}
     grip_err = []
     for f in files:
         meta, data = read_episode(f)
@@ -73,6 +88,8 @@ def main():
                     frames[t] = name
         A = data["action/joint_pos"]
         S = data["sim/state"]
+        q, v = data["obs/joint_pos"], data["obs/joint_vel"]
+        ahead = (LAG_S + dt * np.arange(k))[:, None]
         for t, name in sorted(frames.items()):
             env.set_state(S[t])
             runner.reset(env)
@@ -85,6 +102,10 @@ def main():
                                 np.abs(np.diff(true[:, [7, 15]], axis=0)).sum(0)))
             e = np.linalg.norm(tp[:, arm] - tt[:, arm], axis=-1) * 1000  # mm, per step
             err[name].append((float(e[0]), float(e.mean()), float(e[-1])))
+            prev = np.r_[A[max(t - 1, 0), :7], A[max(t - 1, 0), 8:15]]
+            for kind, guess in (("coast", q[t] + ahead * v[t]), ("repeat", np.repeat(prev[None], k, axis=0))):
+                e = np.linalg.norm(env.tcp_poses_at(guess)[:, arm, :3] - tt[:, arm], axis=-1) * 1000
+                base[kind][name].append((float(e[0]), float(e.mean()), float(e[-1])))
             grip_err.append(float(np.abs(pred[:, [7, 15]] - true[:, [7, 15]]).mean()))
         print(f"{f.name}: {len(frames)} frames", flush=True)
     print(f"\n{runner.path}\n{len(files)} episodes from {args.episodes}; TCP error of the moving arm, mm "
@@ -96,6 +117,9 @@ def main():
         print(f"  {name:6s} n={len(v):4d}  median {np.median(v[:, 0]):5.1f} / {np.median(v[:, 1]):5.1f} / "
               f"{np.median(v[:, 2]):5.1f}   p90 {np.percentile(v[:, 0], 90):5.1f} / "
               f"{np.percentile(v[:, 1], 90):5.1f} / {np.percentile(v[:, 2], 90):5.1f}")
+        for kind in base:
+            b = np.median(np.array(base[kind][name]), axis=0)
+            print(f"         {kind:6s}       median {b[0]:5.1f} / {b[1]:5.1f} / {b[2]:5.1f}")
     print(f"  gripper |pred - demo| mean {np.mean(grip_err):.3f} (0 closed .. 1 open)")
     runner.close()
 
