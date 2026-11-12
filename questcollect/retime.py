@@ -170,13 +170,6 @@ class _Timeline:
             last = p.e - 1
         return last
 
-    def to_new(self, f: int) -> int | None:
-        """New time at which the move holding source frame f plays it (None: f is in a hold)."""
-        for start, p in self.items:
-            if p.s <= f < p.e:
-                return start + f - p.s
-        return None
-
     def indices(self, length: int, ease: int = 0) -> np.ndarray:
         """Source frame per new step, holds time-warped from the source's hold frames. ease > 0: around a staging
         split the frames are box-averaged over 2 ease + 1 steps (fractional: the arm slows into the wait and
