@@ -123,3 +123,14 @@ def test_until_level_ends_takes_after_that_click():
     assert kept_spans(a, CurateConfig(until_level=1)) == [(10, 1050)]  # 20 s + 1 s tail
     a.level_times = [None, None, None]
     assert kept_spans(a, CurateConfig(until_level=1)) == []
+
+
+def test_until_level_counts_reaching_it_as_success():
+    from questcollect.audit import EpisodeAudit, verdict
+    a = EpisodeAudit(file="x", num_steps=3000, fps=50, success=False,
+                     contact_frac={k: 0.0 for k in ("link_table", "arm_arm", "tip_table")},
+                     contact_events={k: 0 for k in ("link_table", "arm_arm", "tip_table")}, idle_frac=0.0,
+                     active=(10, 2990), level_times=[20.0, None, None], operator_runs=[(0, 3000)], contact_runs={})
+    assert verdict(a, CurateConfig(), {}) == "failed take"
+    assert verdict(a, CurateConfig(until_level=1), {}) is None
+    assert verdict(a, CurateConfig(until_level=2), {}) == "failed take"

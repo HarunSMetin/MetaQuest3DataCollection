@@ -36,6 +36,7 @@ PREVIEW_SIZE = (240, 320)
 IK_WARN_M = 0.03
 DART_TAU_S = 0.5           # DART drift correlation time: slow drifts the operator sees and corrects
 DART_SMOOTH_S = 0.2        # ... low-passed once more, so the arm drifts instead of trembling
+GRIP_CATCH = 0.15          # a latched gripper follows its Trigger again once the Trigger is this close to it
 BLOCKED_RAD = 0.05          # the safety filter changed a joint target this much: warn the operator
 CONTROL_MODES = ("teleop", "policy", "shared")  # shared: the policy drives until the operator takes control
 REPLAY_SPEED_RANGE = (0.1, 8.0)  # slowest / fastest dashboard replay speed
@@ -110,6 +111,8 @@ class Runtime:
         self._warn = {"arm_collision": False, "table_collision": False, "ik_saturated": False, "blocked": False}
         self._reach = {a: False for a in ARMS}
         self._engaged = {a: False for a in ARMS}
+        self._policy_grip = np.ones(len(ARMS))      # the policy's last gripper command
+        self._grip_latch: list[float | None] = [None] * len(ARMS)  # held over a takeover until the Trigger matches
         self._warn_sound_at: dict[tuple[str, str | None], float] = {}
         self._base_in_area = False
         self._held: dict[str, int | None] = {a: None for a in ARMS}
@@ -363,12 +366,22 @@ class Runtime:
             if self._driver != "policy":  # (re)starting: a fresh chunk from the current state
                 self.policy.reset(env)
             q_wanted, grippers = self.policy.act(env)
+            self._policy_grip = np.array(grippers, float)
+            self._grip_latch = [None, None]
         else:
             for a in ARMS:
                 p, R = out.targets[a]
                 self.ik.set_target(a, p, mat_to_quat_wxyz(R))
             self.ik.follow(q_measured)
-            q_wanted, grippers = self.ik.solve(), out.grippers
+            q_wanted, grippers = self.ik.solve(), np.array(out.grippers, float)
+            if self._driver == "policy":  # takeover: each gripper keeps the policy's command (a held brick stays held)
+                self._grip_latch = [float(g) for g in self._policy_grip]
+            for i in range(len(ARMS)):  # ... until that controller's Trigger is brought to the same opening
+                if self._grip_latch[i] is not None:
+                    if abs(grippers[i] - self._grip_latch[i]) < GRIP_CATCH:
+                        self._grip_latch[i] = None
+                    else:
+                        grippers[i] = self._grip_latch[i]
 
         prev_state = self.recorder.state
         self.recorder.tick(now)

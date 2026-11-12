@@ -37,6 +37,8 @@ PRE_S = 1.5        # pick window starts this long before the gripper closes (the
 PLACE_M = 0.03     # place window starts when the source brick is within this of its final xy
 POST_S = 0.6       # windows extend this long past the gripper opening (lift-off)
 FREEZE_Z = 0.008   # the in-hand correction is followed until the brick is this close above its seat, then frozen
+GRASP_MIN_FRAC = 0.4      # an off-centre grasp shift is 40-100 % of the allowed range, either way
+GRASP_PAD_M = 0.012       # an off-centre grasp stays this far inside the brick's end (finger pad half width + margin)
 MAX_CORRECTION_M = 0.03  # in-hand corrections larger than this are not applied
 EXTRA_S = 3.0      # time allowed past the end of the commands for the tower to finish and settle
 CLEAR_TOL_M = 0.005  # where the source itself came closer than ARM/CAM_CLEAR_M, a take may come this much closer
@@ -153,7 +155,7 @@ class Take:
 
 def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray] | None = None,
            spawn: dict | None = None, d_tower: float = 0.0, d_base=(0.0, 0.0), arm_start: dict | None = None,
-           joints: bool = False) -> Take:
+           joints: bool = False, grasp_shift: dict[int, np.ndarray] | None = None) -> Take:
     """Play a source take (data from read_episode with KEYS) from its first state, adapted (module docstring).
     frames: per arm the source frame to play at each new step (default: as recorded); spawn: brick name ->
     (xy, yaw) start; d_tower (rad) / d_base (m, xy): turn/shift of the tower about the source's base; arm_start:
@@ -161,8 +163,11 @@ def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray]
     joints: play each arm's recorded joint targets at its frame instead (no IK, no adaptation). Exact for the
     source's own timing; for a retimed take (same layout, each arm's moves in order) the scene mostly evolves as
     recorded, and the IK path's small tracking errors (p99 7-40 mm while pressing) can't grow into a missed brick.
-    Not with spawn / d_tower / d_base / arm_start, which need the IK."""
-    if joints and (spawn or d_tower or np.any(d_base) or arm_start):
+    Not with spawn / d_tower / d_base / arm_start, which need the IK.
+    grasp_shift: brick index -> world xy (m) its start is moved by while the hand still reaches where the source
+    hand did, so it grasps the brick that far off centre; the place then follows the brick through the in-hand
+    correction (an off-centre grasp that still lands aligned)."""
+    if joints and (spawn or d_tower or np.any(d_base) or arm_start or grasp_shift):
         raise ValueError("joints=True replays the recorded layout only")
     n = len(data["action/joint_pos"])
     frames = frames or {a: np.arange(n) for a in ARMS}
@@ -180,6 +185,11 @@ def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray]
         for b in BRICKS:
             xy, yaw = spawn[b.name]
             set_brick_pose(env.data, b.name, [*xy, env.table_height], yaw)
+        mujoco.mj_forward(env.model, env.data)
+    for i, dxy in (grasp_shift or {}).items():
+        b = ob[0, i]
+        set_brick_pose(env.data, BRICKS[i].name, [b[0] + dxy[0], b[1] + dxy[1], b[2]], _quat_yaw(b[3:]))
+    if grasp_shift:
         mujoco.mj_forward(env.model, env.data)
     ee_src = {"l": data["action/ee_pose"][:, 0:7], "r": data["action/ee_pose"][:, 7:14]}
     ik = BimanualIK(env.cfg.sim, env.cfg.ik, env.control_dt)
@@ -346,12 +356,18 @@ def check(take: Take, limits: Limits, clearance: ArmClearance) -> tuple[int | No
 # -- generation ------------------------------------------------------------------------------------
 def generate(src: Path, seed: int, out_dir: Path | None, identity: bool = False, keep_failed: bool = False,
              jitter: float = SPAWN_JITTER_M, spawn_yaw: float = SPAWN_YAW, tower_yaw: float = 0.0,
-             tower_frac: float = 1.0, base_xy: float = 0.0, arm_xy: float = 0.0, arm_yaw: float = 0.0) -> dict:
+             tower_frac: float = 1.0, base_xy: float = 0.0, arm_xy: float = 0.0, arm_yaw: float = 0.0,
+             grasp_offset: float = 0.0, grasp_across: float = 0.0, grasp_bricks: tuple[int, ...] = (0, 1),
+             layout: bool = True, min_cam_m: float | None = None) -> dict:
     """One take from src in a new layout drawn from seed; written to out_dir if it passes `check` (or keep_failed).
     jitter (m) / spawn_yaw (rad): +- range of each brick's start around its SPAWN centre; tower_yaw (rad): +- turn
     of the whole tower about the source's base, in a tower_frac share of the takes; base_xy (m): +- shift of the
     base; arm_xy (m) / arm_yaw (rad): +- offset of each arm's starting TCP (z gets half of arm_xy), which fades
-    out on the way to its first brick. identity: replay the source unchanged (a check of the replay itself)."""
+    out on the way to its first brick. identity: replay the source unchanged (a check of the replay itself).
+    grasp_offset / grasp_across (m): +- off-centre grasp of each brick in grasp_bricks, along its long axis
+    (capped so the finger pads stay on the brick) / across it; layout=False keeps the source layout otherwise.
+    min_cam_m: accept wrist cameras this close (m) instead of CAM_CLEAR_M (the IK replay of a retimed take runs a
+    centimetre closer than its joint replay; nothing touches)."""
     src = Path(src)
     meta, data = read_episode(src, keys=KEYS)
     fps = int(meta["fps"])
@@ -370,14 +386,43 @@ def generate(src: Path, seed: int, out_dir: Path | None, identity: bool = False,
             off = rng.uniform(-1, 1, 3) * [arm_xy, arm_xy, arm_xy / 2]
             _, q = Xf(planar([0, 0], 0, [0, 0], rng.uniform(-arm_yaw, arm_yaw)))(p0)
             arm_start[a] = np.r_[p0[:3] + off, q]
-    if identity:
+    grasp_shift = {}
+    if grasp_offset > 0 or grasp_across > 0:
+        first_grasp = {}  # brick -> (arm, close frame) of the source's first grasp of it
+        for a, cs in cycles(data, fps).items():
+            for i, tc, *_ in cs:
+                if i not in first_grasp or tc < first_grasp[i][1]:
+                    first_grasp[i] = (a, tc)
+        for i in grasp_bricks:
+            if i not in first_grasp:
+                continue
+            a, tc = first_grasp[i]
+            r = np.zeros(9)
+            mujoco.mju_quat2Mat(r, data["action/ee_pose"][tc, 7 * ARMS.index(a) + 3:7 * ARMS.index(a) + 7])
+            close = r.reshape(3, 3)[:2, 1]  # the fingers close along the TCP y axis
+            yaw = _quat_yaw(data["obs/objects"][0, i, 3:])
+            bx, by = np.array([np.cos(yaw), np.sin(yaw)]), np.array([-np.sin(yaw), np.cos(yaw)])
+            # slide along the brick axis the fingers don't close on (between the pads), capped at its end
+            (along, half), (across, _) = sorted([(bx, BRICKS[i].half[0]), (by, BRICKS[i].half[1])],
+                                                key=lambda e: abs(e[0] @ close))
+            along_max = max(0.0, min(grasp_offset, half - GRASP_PAD_M))
+            u = rng.choice([-1, 1]) * rng.uniform(GRASP_MIN_FRAC, 1.0) * along_max  # mostly clearly off centre
+            grasp_shift[i] = u * along + rng.uniform(-grasp_across, grasp_across) * across
+    if identity or not layout:
         spawn, d_tower, d_base, arm_start = None, 0.0, np.zeros(2), None
-    take = replay(env, data, fps, spawn=spawn, d_tower=d_tower, d_base=d_base, arm_start=arm_start)
+    if identity:
+        grasp_shift = {}
+    take = replay(env, data, fps, spawn=spawn, d_tower=d_tower, d_base=d_base, arm_start=arm_start,
+                  grasp_shift=grasp_shift or None)
     clearance = ArmClearance(env.cfg.sim)
-    bad, summary = check(take, Limits.of_source(data, clearance), clearance)
+    limits = Limits.of_source(data, clearance)
+    if min_cam_m is not None:
+        limits.cam_m = min(limits.cam_m, min_cam_m)
+    bad, summary = check(take, limits, clearance)
     res = {"src": src.name, "seed": seed, "ok": bad is None, **summary, "len_s": round(len(take.steps) / fps, 1),
            "tower_yaw_deg": round(float(np.rad2deg(d_tower)), 1),
-           "base_shift_mm": [round(float(v) * 1000, 1) for v in d_base]}
+           "base_shift_mm": [round(float(v) * 1000, 1) for v in d_base],
+           "grasp_shift_mm": {BRICKS[i].name: [round(float(x) * 1000, 1) for x in d] for i, d in grasp_shift.items()}}
     if out_dir is not None and (bad is None or keep_failed):
         env.seed = seed
         m = episode_meta(env.cfg, env, len(take.steps), bool(take.end),
@@ -388,6 +433,8 @@ def generate(src: Path, seed: int, out_dir: Path | None, identity: bool = False,
             "seed": seed, "spawn_jitter_m": jitter, "spawn_yaw_deg": float(np.rad2deg(spawn_yaw)),
             "tower_yaw_range_deg": float(np.rad2deg(tower_yaw)), "tower_yaw_deg": float(np.rad2deg(d_tower)),
             "tower_frac": tower_frac, "base_xy_m": base_xy, "base_shift_m": d_base.tolist(), "arm_xy_m": arm_xy,
-            "arm_yaw_deg": float(np.rad2deg(arm_yaw))})
+            "arm_yaw_deg": float(np.rad2deg(arm_yaw)), "layout": layout and not identity,
+            "grasp_offset_m": grasp_offset, "grasp_across_m": grasp_across, "min_cam_m": min_cam_m,
+            "grasp_shift_m": {BRICKS[i].name: d.tolist() for i, d in grasp_shift.items()}})
         res["path"] = str(write_episode(Path(out_dir) / f"gen_{src.stem}_s{seed}.hdf5", take.steps, m))
     return res

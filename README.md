@@ -178,6 +178,7 @@ Everything goes through the `qc` command (run it as `uv run qc …`; every comma
 | `qc audit` | quality report of every episode, and which ones training will use |
 | `qc retime` | experimental: overlap the arms' work in recorded takes (re-simulated, originals kept) |
 | `scripts/generate_set.py <out>` | experimental: new takes from the recorded ones in new brick layouts (re-simulated, checked) |
+| `scripts/generate_grasps.py <src> --out <dir>` | experimental: the same takes with off-centre grasps (re-simulated, checked) |
 | `qc export <name>` | turn the selected episodes into a LeRobot dataset |
 | `qc train <dataset>` | train a policy on a dataset (lerobot-train) |
 | `qc eval <run>` | test a trained policy in the simulator |
@@ -411,6 +412,15 @@ uv run python scripts/generate_set.py data/episodes_generated --per 10   # 10 ke
 uv run qc retime data/episodes_generated/episode_*.hdf5 --out data/episodes_generated_retimed
 ```
 
+`scripts/generate_grasps.py` keeps your layout and timing but makes the grasps off centre: each brick starts
+shifted along the axis between the finger pads (40-100 % of up to `--offset` 2 cm, capped so the pads stay on
+it) while the hand reaches where yours did, and the place follows the brick in the hand. It shows a policy how to
+place a brick it grasped 1-2 cm off. Sources excluded with `qc audit --exclude` are skipped.
+
+```bash
+uv run python scripts/generate_grasps.py data/episodes_retimed_v4 --out data/episodes_grasp_v4 --seeds 8 --jobs 6
+```
+
 **2. Export a dataset.** Renders the cameras from the recorded states, in the scene each episode was recorded in:
 
 ```bash
@@ -437,7 +447,11 @@ The `act_240` preset is [ACT](https://tonyzhaozh.github.io/aloha/) (action chunk
 `--preset dp_240` is [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) (CNN U-Net, 64-step horizon,
 re-planned every 16 steps, DDIM): batch 32, ~5.1 GB, ~9.5 hours for 80k steps. Why these settings, and the
 results so far: [experiments/diffusion/README.md](experiments/diffusion/README.md). `dp_240_pre` is the same with
-an ImageNet-pretrained ResNet18 image encoder (`dp_240` learns it from scratch).
+an ImageNet-pretrained ResNet18 image encoder (`dp_240` learns it from scratch). `dp_240_pre_ema` also keeps an
+exponential moving average of the weights and saves that as the checkpoint, like the original Diffusion Policy
+(LeRobot's has none): a preset key `ema: <max decay>` makes `qc train` run
+[learn/lerobot_train_ema.py](questcollect/learn/lerobot_train_ema.py) instead of `lerobot-train` (same arguments;
+the raw weights are kept as `model_raw.safetensors`, +0.4 GB GPU).
 
 **4. Evaluate.** Runs the policy in the simulator on 50 fixed scenes it never saw, as fast as the PC allows:
 
@@ -465,8 +479,11 @@ uv run qc serve --policy outputs/<run>            # shared control: the policy d
 uv run qc serve --policy outputs/<run> --control policy   # policy only
 ```
 
-In shared mode, press **Grip** whenever the policy is about to go wrong. You take over that arm from exactly where
-it is; release it and the policy carries on. Record while you do this: the steps you drove are marked in the
+In shared mode, press **Grip** whenever the policy is about to go wrong. You take over from exactly where the arms
+are: the arm you engaged follows your hand, the other one holds still (the policy pauses for both). Each gripper
+keeps the policy's last command (a held brick stays held) until you bring that controller's Trigger to the same
+opening (squeezed for a closed gripper); from then on the Trigger drives it. Release every arm and the policy
+carries on. Record while you do this: the steps you drove are marked in the
 episode, and the next `qc export` uses only your corrections from these takes (`curate.dagger_frames`). That is
 the most effective data you can add: it shows the policy how to recover from its own mistakes. The dashboard's
 Teleoperation card switches between *You drive*, *Shared* and *Policy*.
@@ -669,7 +686,7 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | `curate.*` | | which episodes and steps training uses: contact limits, `cut_contacts` + `contact_margin_s` (arm-on-table or arm-arm moments are cut out, the rest of the take is kept), `trim_idle`, `include_failures`, `dagger_frames`, `until_level` (+ `until_level_tail_s`: train on each take only until that tower level clicked) |
 | `learn.cameras`, `image_size`, `action`, `env_state`, `joint_vel`, `ee_wrench`, `action_label` | 3 cameras, 240×320, joint, false, true, true, executed | what a policy sees and outputs; `action_label`: train on the targets actually sent (`executed`, DART drift included) or the operator's before the drift (`recorded`) |
 | `learn.datasets_dir`, `runs_dir` | `data/lerobot`, `outputs` | where datasets and training runs go |
-| `learn.presets` | `act_240`, `dp_240`, `dp_240_pre` | named lerobot-train settings for `qc train --preset` |
+| `learn.presets` | `act_240`, `dp_240`, `dp_240_pre`, `dp_240_pre_ema` | named lerobot-train settings for `qc train --preset` |
 | `safety.enabled`, `arm_margin`, `table_margin`, `finger_table_margin` | true, 0.02, 0.01, 0.005 | the safety filter on every action, teleop and policy: distances it keeps between the arms, arm links and the table, fingertips and the table (m) |
 | `control.mode`, `policy`, `n_action_steps` | teleop, none, 10 | who drives in `qc serve`, and how often a live policy is asked |
 

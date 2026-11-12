@@ -12,7 +12,12 @@ a preset in `config.yaml` (`learn.presets`) plus a note here. Run one with
 | 2026-11-02 | `20261031-2200_act_240_tower_v2` | tower_v2: 108 retimed, generated | ACT `act_240` | 0/50, 0/50 (ensemble) | picks and carries; placement 6–8 mm off ([below](#act-on-tower_v2)) |
 | 2026-11-02 | `20261102-0505_dp_240_tower_v2` | tower_v2 | Diffusion `dp_240` | 0/50 | base in area 48%, level 1 4%; the blue brick is never lifted in 29/50 ([diffusion/](diffusion/README.md)) |
 | 2026-11-03 | `20261103-0116_dp_state_tower_v2_state` | tower_v2_state | Diffusion `dp_state`, brick poses instead of cameras | 0/50 | level 1 22% (cameras: 0–4%), still 7 mm off; action side is the larger bottleneck ([state_oracle/](state_oracle/README.md)) |
-| 2026-11-06 | `20261106-0108_dp_240_tower_v3` | tower_v3: 71 unassisted hand demos (DART on), executed-target labels | Diffusion `dp_240`, joint actions + joint_vel + hand wrench | (running) | [tower_v3/](tower_v3/README.md) |
+| 2026-11-06 | `20261106-0108_dp_240_tower_v3` | tower_v3: 71 unassisted hand demos (DART on), executed-target labels | Diffusion `dp_240`, joint actions + joint_vel + hand wrench | 0/20 (stopped), level 1 0% | [tower_v3/](tower_v3/README.md) |
+| 2026-11-07 | `20261106-2147_dp_240_pre_two_bricks_v4` | two_bricks_v4: 50 retimed (staged) takes, until level 1 | Diffusion `dp_240_pre` (ImageNet ResNet18), cam_low + wrists | level 1 16% | [two_bricks/](two_bricks/README.md) |
+| 2026-11-07 | `20261107-1744_dp_ft_mix_v5` | mix_v5: two_bricks_v4 + 116 grasp-offset generated takes | fine-tune of the 60k checkpoint, 30k steps | level 1 14% (no gain; grasps worse) | [two_bricks/](two_bricks/README.md) |
+| 2026-11-12 | `20261111-1316_dp_240_pre_expert_v2` | expert_v2: 200 scripted-expert takes, until level 1 | Diffusion `dp_240_pre` | level 1 2% | fit 1.4 mm open loop, lands 2–7 cm short closed loop ([expert_dagger/](expert_dagger/README.md)) |
+
+Full report of all experiments so far: [REPORT_2026-11-12.md](REPORT_2026-11-12.md).
 
 ### ACT on tower_v2
 

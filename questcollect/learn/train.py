@@ -9,6 +9,7 @@ Run folder layout (outputs/<run>/):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -62,10 +63,13 @@ def train(cfg: Config, preset: str, dataset: str, name: str | None = None, extra
     run = cfg.runs_dir / name
     if run.exists():
         raise FileExistsError(f"run {run} already exists")
+    args = dict(cfg.learn.presets[preset])
+    ema = args.pop("ema", None)  # ours, not lerobot-train's: max decay of a weight EMA (lerobot_train_ema.py)
     exe = Path(sys.executable).parent / "lerobot-train"  # installed with the `learn` extra, next to python
-    argv = [str(exe), _arg("dataset.repo_id", manifest["repo_id"]), _arg("dataset.root", data_root),
+    cmd = [sys.executable, "-m", "questcollect.learn.lerobot_train_ema"] if ema else [str(exe)]
+    argv = [*cmd, _arg("dataset.repo_id", manifest["repo_id"]), _arg("dataset.root", data_root),
             _arg("output_dir", run / "train"), _arg("job_name", name),
-            *(_arg(k, v) for k, v in cfg.learn.presets[preset].items()), *(extra or [])]
+            *(_arg(k, v) for k, v in args.items()), *(extra or [])]
     if dry_run:
         print(" ".join(argv))
         return run
@@ -74,5 +78,6 @@ def train(cfg: Config, preset: str, dataset: str, name: str | None = None, extra
         "created_at": datetime.now().isoformat(timespec="seconds"), "git_commit": git_commit(),
         "preset": preset, "dataset": dataset, "dataset_root": str(data_root), "dataset_manifest": manifest,
         "command": argv}, indent=1))
-    subprocess.run(argv, check=True)
+    env = {**os.environ, "QC_EMA_MAX_DECAY": str(ema)} if ema else None
+    subprocess.run(argv, check=True, env=env)
     return run

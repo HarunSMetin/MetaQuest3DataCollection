@@ -195,7 +195,9 @@ def verdict(a: EpisodeAudit, rules: CurateConfig, curation: dict) -> str | None:
     """Why an episode is left out of training datasets, or None if it is used."""
     if curation.get(a.file, {}).get("exclude"):
         return "excluded by hand" + (f": {curation[a.file]['note']}" if curation[a.file].get("note") else "")
-    if not labelled_success(a, curation) and not rules.include_failures:
+    reached = rules.until_level is not None and rules.until_level <= len(a.level_times) \
+        and a.level_times[rules.until_level - 1] is not None  # a sub-task dataset: that level is the success
+    if not labelled_success(a, curation) and not rules.include_failures and not reached:
         return "failed take"
     limits = {"link_table": (rules.max_link_table_frac, "arm link on the table"),
               "arm_arm": (rules.max_arm_arm_frac, "arms touching"),

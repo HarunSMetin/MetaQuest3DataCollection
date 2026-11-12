@@ -6,10 +6,12 @@
 #   scripts/train_and_eval.sh <dataset> [preset=act_240] [rollouts=50]
 #   scripts/train_and_eval.sh --resume outputs/<run> [rollouts=50]   # continue from its last checkpoint
 #   QC_CONFIG=experiments/<x>/config.yaml scripts/train_and_eval.sh ...  # presets from another config
+#   QC_TRAIN_ARGS="--policy.path=outputs/<run>/train/checkpoints/060000/pretrained_model" ...  # extra qc train args
 #
 # Log: outputs/<run>.log (outputs/latest.log points to it). Results: outputs/<run>/RESULTS.txt.
-# Stop training early with `pkill -f train_and_eval.sh; pkill -f lerobot-train`, and resume later with --resume
-# (from the last saved checkpoint, every 20k steps). `pkill -f lerobot-train` alone evaluates that checkpoint now.
+# Stop training early with `pkill -f train_and_eval.sh; pkill -f 'lerobot-train|lerobot_train_ema'`, and resume later
+# with --resume (from the last saved checkpoint, every 20k steps; an `ema:` preset resumes without the EMA).
+# `pkill -f 'lerobot-train|lerobot_train_ema'` alone evaluates that checkpoint now.
 set -uo pipefail
 self="$(realpath "$0")"
 cd "$(dirname "$self")/.."
@@ -30,8 +32,8 @@ else
 fi
 
 if [[ -z "${QC_DETACHED:-}" ]]; then  # start a detached copy of this script under a sleep/lid inhibitor
-    if pgrep -f lerobot-train >/dev/null; then
-        echo "lerobot-train is already running (pgrep -fa lerobot-train); stop it first, the GPU fits one"
+    if pgrep -f 'lerobot-train|lerobot_train_ema' >/dev/null; then
+        echo "a training is already running (pgrep -fa 'lerobot-train|lerobot_train_ema'); stop it first, the GPU fits one"
         exit 1
     fi
     mkdir -p outputs
@@ -53,7 +55,8 @@ if (( resume )); then
         --resume=true
 else
     stamp "train $dataset with $preset -> $run"
-    qc train "$dataset" --preset "$preset" --name "$name"
+    read -ra train_args <<< "${QC_TRAIN_ARGS:-}"
+    qc train "$dataset" --preset "$preset" --name "$name" "${train_args[@]}"
 fi
 status=$?
 if (( status == 0 )); then

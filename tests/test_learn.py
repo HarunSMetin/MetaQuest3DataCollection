@@ -86,3 +86,22 @@ def test_export_train_eval(cfg, tmp_path):
     meta, data = read_episode(results / "episode_000000.hdf5")
     assert meta["source"] == "policy" and data["control/source"].tolist() == [1] * 15
     assert data["action/joint_pos"].shape == (15, 16)
+
+
+def test_ema_averages_weights_and_swaps_them_in():
+    from questcollect.learn.lerobot_train_ema import Ema
+
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.BatchNorm1d(2))
+    ema = Ema()
+    ema.update(model)  # first call: copy
+    start = model[0].weight.detach().clone()
+    for _ in range(50):
+        with torch.no_grad():
+            model[0].weight.add_(1.0)
+        ema.update(model)
+    avg = ema.shadow["0.weight"]
+    assert torch.all(avg > start) and torch.all(avg < model[0].weight)  # lags behind the raw weights
+    raw = ema.swap(model)
+    assert torch.equal(model[0].weight, avg) and torch.equal(raw["0.weight"], start + 50)
+    model.load_state_dict(raw)
+    assert torch.equal(model[0].weight, start + 50)

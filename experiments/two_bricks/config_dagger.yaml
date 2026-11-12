@@ -1,0 +1,162 @@
+# DAgger on the two_bricks task: uv run qc serve --config experiments/two_bricks/config_dagger.yaml
+# QuestCollect settings. Pass another file with `qc serve --config my.yaml`.
+
+sim:
+  physics_dt: 0.002          # 500 Hz physics
+  control_hz: 50             # control + recording rate
+  table_height: 0.75
+  arm_spacing: 0.6           # distance between the two arm bases (m)
+  arm_base_x: -0.05          # x of the arm bases (m); 0 before 2026-11-03 (old episodes keep it)
+  gripper_force: 40          # N squeeze when closed on an object (real Franka Hand: <= 70 N continuous)
+
+teleop:
+  mode: controllers          # controllers | hands
+  scale: 1.0                 # hand motion -> end-effector motion
+  pinch_open_m: 0.08         # thumb-index distance mapped to fully open gripper
+  pinch_closed_m: 0.015      # thumb-index distance mapped to closed gripper
+  filter_min_cutoff: 1.5     # One-Euro filter params
+  filter_beta: 0.5
+  workspace_min: [0.05, -0.65, 0.755]  # z: a DUPLO grasp sits ~1 cm above the table
+  workspace_max: [0.95, 0.65, 1.45]
+
+ik:
+  position_cost: 1.0
+  orientation_cost: 0.6
+  posture_cost: 0.01
+  max_joint_vel: 2.5         # rad/s
+  max_lead: 0.15             # rad the IK may run ahead of the measured joints (no windup when an arm is blocked)
+  damping_cost: 0.1          # prefer small joint motions: stops the folded arm whipping joints 1+3 / 5+7
+  avoid_arm_collisions: false  # true: IK keeps the arms collision_margin apart; false: they really collide
+  collision_margin: 0.03     # min distance between the two arms (m)
+  iterations: 2
+
+record:
+  out_dir: data/dagger_v1    # DAgger takes (shared control); data/episodes_retimed_v4 stays untouched
+  countdown_s: 3
+  cameras: [cam_high, cam_low, cam_left_wrist, cam_right_wrist]   # dashboard previews
+  operator: operator
+  action_noise: 0.0
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  https_port: 8443
+  cert_dir: certs
+
+# --- policy learning (qc audit / export / train / eval; needs `uv sync --extra learn`) ---------------
+
+curate:                      # which recorded steps go into a training dataset (see `qc audit`)
+  include_failures: false
+  max_link_table_frac: 0.01  # arm links resting on the table
+  max_arm_arm_frac: 0.0      # the two arms touching
+  max_tip_table_frac: 0.3    # hand/fingertips on the table (some is normal: bricks are 19 mm tall)
+  cut_contacts: [link_table, arm_arm]  # cut these contacts out of the take; their max_*_frac then don't apply
+  contact_margin_s: 0.2      # also cut this long before and after each cut contact
+  trim_idle: true            # drop the still start and end of each episode
+  dagger_frames: operator    # shared-control episodes: only the operator's corrections, or `all`
+  until_level: 1             # this experiment: each take only until the blue brick clicked on the red one (+1 s)
+
+learn:                       # what the policy sees and outputs (fixed per dataset, stored in its manifest)
+  cameras: [cam_low, cam_left_wrist, cam_right_wrist]   # this experiment: cam_low sees the tower from the side (cam_high is mostly arms)
+  image_size: [240, 320]     # height, width; 480x640 does not fit a 6 GB GPU with ACT
+  action: joint              # joint | ee (TCP position + 6D rotation, IK at run time)
+  env_state: false           # brick poses as an input (privileged: simulation only)
+  joint_vel: true            # joint velocities in observation.state too (16 -> 30 values)
+  ee_wrench: true            # external force/torque on each hand in observation.state too (+12 values)
+  action_label: executed     # recorded (operator target before the DART drift) | executed (target sent, from sim/state)
+  datasets_dir: data/lerobot
+  runs_dir: outputs
+  presets:                   # `qc train <dataset> --preset <name>`: lerobot-train arguments
+    act_240:                 # RTX 4050 6 GB: ~3.6 GB, ~54 samples/s, ~8 h
+      policy.type: act
+      policy.device: cuda
+      policy.use_amp: true
+      policy.chunk_size: 100
+      policy.n_action_steps: 100
+      policy.push_to_hub: false
+      batch_size: 16
+      num_workers: 8
+      steps: 100000
+      save_freq: 20000
+      tolerance_s: 0.001     # video frame time match; the 1e-4 default fails on float32 timestamps
+                             # past ~1000 s into a dataset's video file (frames are 0.02 s apart)
+    dp_240:                  # Diffusion Policy (CNN U-Net); why these values: experiments/diffusion/README.md
+      policy.type: diffusion         # RTX 4050 6 GB: ~5.1 GB, ~76 samples/s, ~9.5 h
+      policy.device: cuda
+      policy.use_amp: true
+      policy.n_obs_steps: 1          # 2 frames 20 ms apart add little (joint_vel is in the state) and halve the batch
+      policy.horizon: 64             # 1.28 s at 50 Hz; a multiple of 2^len(down_dims)
+      policy.n_action_steps: 16      # re-plan every 0.32 s (closed loop for the last millimetres)
+      policy.drop_n_last_frames: 48  # horizon - n_action_steps - n_obs_steps + 1
+      policy.resize_shape: [240, 320]
+      policy.crop_ratio: 0.9         # random 216x288 crop while training, centre crop at inference
+      policy.use_separate_rgb_encoder_per_camera: true
+      policy.down_dims: [256, 512, 1024]
+      policy.noise_scheduler_type: DDIM
+      policy.num_train_timesteps: 100
+      policy.num_inference_steps: 10
+      policy.push_to_hub: false
+      batch_size: 32                 # with n_obs_steps 2 only 16 fits
+      num_workers: 8
+      steps: 80000
+      save_freq: 20000
+      tolerance_s: 0.001
+    dp_240_pre:                # dp_240 with an ImageNet-pretrained ResNet18 (BatchNorm kept: GroupNorm would discard
+      policy.type: diffusion   # the pretrained weights); dp_240 learns the encoder from scratch
+      policy.device: cuda
+      policy.use_amp: true
+      policy.n_obs_steps: 1
+      policy.horizon: 64
+      policy.n_action_steps: 16
+      policy.drop_n_last_frames: 48
+      policy.resize_shape: [240, 320]
+      policy.crop_ratio: 0.9
+      policy.use_separate_rgb_encoder_per_camera: true
+      policy.pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+      policy.use_group_norm: false
+      policy.down_dims: [256, 512, 1024]
+      policy.noise_scheduler_type: DDIM
+      policy.num_train_timesteps: 100
+      policy.num_inference_steps: 10
+      policy.push_to_hub: false
+      batch_size: 32
+      num_workers: 8
+      steps: 80000
+      save_freq: 20000
+      tolerance_s: 0.001
+    dp_240_pre_ema:            # dp_240_pre, evaluated with an EMA of the weights like the original Diffusion Policy
+      ema: 0.9999              # (not lerobot-train's: qc train runs learn/lerobot_train_ema.py; +0.4 GB GPU)
+      policy.type: diffusion
+      policy.device: cuda
+      policy.use_amp: true
+      policy.n_obs_steps: 1
+      policy.horizon: 64
+      policy.n_action_steps: 16
+      policy.drop_n_last_frames: 48
+      policy.resize_shape: [240, 320]
+      policy.crop_ratio: 0.9
+      policy.use_separate_rgb_encoder_per_camera: true
+      policy.pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+      policy.use_group_norm: false
+      policy.down_dims: [256, 512, 1024]
+      policy.noise_scheduler_type: DDIM
+      policy.num_train_timesteps: 100
+      policy.num_inference_steps: 10
+      policy.push_to_hub: false
+      batch_size: 32
+      num_workers: 8
+      steps: 80000
+      save_freq: 20000
+      tolerance_s: 0.001
+
+safety:                      # keeps the arms off each other and the table: teleop and policy alike
+  enabled: true
+  arm_margin: 0.02           # m between the two arms
+  table_margin: 0.01         # m between arm links and the table top
+  finger_table_margin: 0.005 # m between the fingers and the table top; pushed hard they stop ~4.7 mm above it,
+                             # and the pads still cover 14 mm of a 19 mm brick's side
+
+control:                     # who drives in `qc serve`: teleop | policy | shared (policy until you take over)
+  mode: shared               # the policy drives until you take over with Grip
+  policy: outputs/20261106-2147_dp_240_pre_two_bricks_v4/train/checkpoints/060000/pretrained_model  # best so far: 84% / 14%
+  n_action_steps: 16         # as trained (eval: 16 steps 84%/14%, 8 steps 60%/8%)

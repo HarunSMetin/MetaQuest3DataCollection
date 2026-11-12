@@ -123,6 +123,30 @@ learn:                       # what the policy sees and outputs (fixed per datas
       steps: 80000
       save_freq: 20000
       tolerance_s: 0.001
+    dp_240_pre_ema:            # dp_240_pre, evaluated with an EMA of the weights like the original Diffusion Policy
+      ema: 0.9999              # (not lerobot-train's: qc train runs learn/lerobot_train_ema.py; +0.4 GB GPU)
+      policy.type: diffusion
+      policy.device: cuda
+      policy.use_amp: true
+      policy.n_obs_steps: 1
+      policy.horizon: 64
+      policy.n_action_steps: 16
+      policy.drop_n_last_frames: 48
+      policy.resize_shape: [240, 320]
+      policy.crop_ratio: 0.9
+      policy.use_separate_rgb_encoder_per_camera: true
+      policy.pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+      policy.use_group_norm: false
+      policy.down_dims: [256, 512, 1024]
+      policy.noise_scheduler_type: DDIM
+      policy.num_train_timesteps: 100
+      policy.num_inference_steps: 10
+      policy.push_to_hub: false
+      batch_size: 32
+      num_workers: 8
+      steps: 80000
+      save_freq: 20000
+      tolerance_s: 0.001
 
 safety:                      # keeps the arms off each other and the table: teleop and policy alike
   enabled: true

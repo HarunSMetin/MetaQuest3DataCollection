@@ -76,6 +76,24 @@ def test_shared_takeover_does_not_jump_and_is_recorded(rt):
     assert rt._driver == "policy" and rt.policy.resets == 2
 
 
+def test_takeover_keeps_the_policy_grippers_until_the_trigger_matches(rt):
+    rt.control_mode = "shared"
+    rt.policy.act = lambda env: (rt.policy.q.copy(), np.zeros(2))  # the policy holds both grippers closed
+    _ticks(rt, 120, _controllers())  # the finger targets move at 50 mm/s: fully closed after ~1 s
+    closed = rt.env.data.ctrl[rt.env.grip_act].copy()
+    assert np.allclose(closed, 0)
+    _ticks(rt, 3, _controllers(squeeze_left=1.0))  # takeover with both Triggers released (= open)
+    _ticks(rt, 30, _controllers())
+    assert rt._driver == "operator"
+    assert np.allclose(rt.env.data.ctrl[rt.env.grip_act], closed)  # nothing dropped
+    f = _controllers()
+    f.left.buttons[0] = 1.0  # left Trigger pulled: matches the closed gripper, so it follows the Trigger again
+    _ticks(rt, 2, f)
+    _ticks(rt, 30, _controllers())  # ... and opens when released
+    assert rt._grip_latch[0] is None and rt._grip_latch[1] is not None
+    assert rt.env.data.ctrl[rt.env.grip_act][0] > closed[0] and np.isclose(rt.env.data.ctrl[rt.env.grip_act][1], closed[1])
+
+
 def test_policy_modes_need_a_policy(rt):
     rt.policy = None
     rt._handle("set_control_mode", {"mode": "policy"}, 0.0)

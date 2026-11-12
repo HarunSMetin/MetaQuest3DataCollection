@@ -28,6 +28,7 @@ uv run qc train <dataset> [--preset act_240] [--dry-run] [--key=value ...]   # -
 uv run qc eval outputs/<run> [--n 50] [--ensemble 0.01]   # -> outputs/<run>/eval/<time>/metrics.json
 uv run qc serve --policy outputs/<run> [--control shared|policy]
 MUJOCO_GL=egl uv run --extra learn python scripts/check_pipeline.py [--config <cfg>] [--dataset <name>]  # before training: data == eval world
+MUJOCO_GL=egl uv run --extra learn python scripts/fit_error.py <run|checkpoint> <episodes dir>  # open-loop mm error on demo frames
 
 uv run --group dev pytest                                   # all tests
 uv run --group dev pytest tests/test_teleop.py::test_protocol_roundtrip   # single test
@@ -135,7 +136,7 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
 - **Generation + retiming** (experimental; `generate.py`, `retime.py`, `scripts/generate_*.py`): `generate.replay`
   plays a take's TCP targets through the IK, adapted: picks follow the brick, each brick is placed relative to the
   brick it goes onto *as it is now* plus an in-hand correction (towers slide a few mm under the press, so replaying
-  recorded joints after any change misses), optionally new layouts / per-arm time maps. `generate.check` accepts a
+  recorded joints after any change misses), optionally new layouts / per-arm time maps / off-centre grasps (`grasp_shift`, `scripts/generate_grasps.py`). `generate.check` accepts a
   take (tower built, no new contacts, `sim.ArmClearance`: arms `ARM_CLEAR_M` / wrist cameras `CAM_CLEAR_M` apart,
   or as close as the source came). Retime schedules moves as early as clearance, the
   one-arm tower zone and gripper settle times allow (staging: a move into the zone is split just outside it, so the
@@ -149,7 +150,7 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   spec hashes differently by float noise). Re-renders match to within 1/255 (GPU shadow noise, also between runs).
 - **Learning** (`questcollect/learn/`, extra `learn`): nothing outside it imports torch/lerobot; the runtime imports
   `learn.policy` only in `Runtime.load_policy`. All LeRobot dataset API in `learn/export.py`; training is a
-  `lerobot-train` subprocess (`learn/train.py`, run layout `outputs/<run>/{questcollect_run.json,train,eval}`);
+  `lerobot-train` subprocess (or `learn/lerobot_train_ema.py`, the same plus a weight EMA, for presets with `ema:`) (`learn/train.py`, run layout `outputs/<run>/{questcollect_run.json,train,eval}`);
   `PolicyRunner` needs that run manifest to know the FeatureSpec. Eval seeds come from `EVAL_SEED_BASE`.
 - **Control modes** (`Runtime._who_drives`): teleop | policy | shared. Policy path = `PolicyRunner.act` →
   `SafetyFilter.filter` (the operator path = IK → the same filter) (mink QP, 8 substeps: the linearized collision limits need them) → apply. While the policy
