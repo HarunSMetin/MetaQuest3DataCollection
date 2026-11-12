@@ -69,41 +69,37 @@ Subject: the expert-data policy `outputs/20261111-1316_dp_240_pre_expert_v2` (le
     ImageNet stats; `drop_n_last_frames`. Normalization resolution: 1 mm at the TCP is 0.001–0.002 of the [−1, 1]
     action range.
 
-## 2. Running when the session stopped
+## 2. The decisive test did not finish: start it again
 
 Two camera-free trainings on the expert takes, to test whether removing joint velocity fixes the closed loop
-(brick poses as input, `dp_state1`, 20k steps, ~4 steps/s each when alone on the GPU):
+(brick poses as input, preset `dp_state1`, 20k steps). They were stopped at step ~5400 of 20000 because the laptop
+had to be shut down, before the first checkpoint, so nothing of them can be resumed. The empty run folders
+`outputs/review_oracle_vel` and `outputs/review_oracle_novel` (only a manifest) and their logs are left as they
+are; ignore or delete them.
 
-| run | state | log |
-|---|---|---|
-| `outputs/review_oracle_vel` | joints + grip + velocity + wrench | `outputs/review_oracle_vel.log` |
-| `outputs/review_oracle_novel` | joints + grip + wrench | `outputs/review_oracle_novel.log` |
+The datasets are exported and ready: `data/lerobot/review_expert_state_vel` (state = joints + grip + velocity +
+wrench) and `data/lerobot/review_expert_state_novel` (joints + grip + wrench).
 
-They were at step ~5000 of 20000 at 2026-11-12, started with `nohup`, checkpoints at 10k and 20k. They survive
-closing the editor but not a shutdown or sleep. Check with `pgrep -af lerobot-train` and
-`ls outputs/review_oracle_*/train/checkpoints`.
-
-If they died before a checkpoint, remove the two run folders (they are this review's own) and start again:
+Start both again under new names (in parallel: ~2.9 GB GPU, ~4 steps/s each, ~85 min; checkpoints every 5k):
 
 ```bash
 for v in vel novel; do
-  nohup uv run --extra learn qc train review_expert_state_$v --preset dp_state1 \
-      --config experiments/obs_ablation/config_$v.yaml --name review_oracle_$v > outputs/review_oracle_$v.log 2>&1 &
+  nohup uv run --extra learn qc train review_expert_state_$v --preset dp_state1 --save_freq=5000 \
+      --config experiments/obs_ablation/config_$v.yaml --name review_oracle2_$v > outputs/review_oracle2_$v.log 2>&1 &
 done
+tail -c 300 outputs/review_oracle2_vel.log        # progress
 ```
 
-If a checkpoint exists, resume instead:
-`.venv/bin/lerobot-train --config_path=outputs/review_oracle_<v>/train/checkpoints/last/pretrained_model/train_config.json --resume=true`
-
-The datasets are exported already: `data/lerobot/review_expert_state_vel`, `data/lerobot/review_expert_state_novel`.
+A stopped run with a checkpoint resumes with
+`.venv/bin/lerobot-train --config_path=outputs/<run>/train/checkpoints/last/pretrained_model/train_config.json --resume=true`.
 
 ## 3. What is left
 
-1. Evaluate both oracle runs (the decisive number; expert itself scores 100% on these seeds):
+1. When both trainings are done, evaluate them (the decisive number; expert itself scores 100% on these seeds):
    ```bash
-   uv run --extra learn qc eval outputs/review_oracle_vel   --config experiments/obs_ablation/config_vel.yaml   --n 50
-   uv run --extra learn qc eval outputs/review_oracle_novel --config experiments/obs_ablation/config_novel.yaml --n 50
-   MUJOCO_GL=egl uv run --extra learn python scripts/drift_test.py outputs/review_oracle_novel data/expert_v2 --config experiments/obs_ablation/config_novel.yaml
+   uv run --extra learn qc eval outputs/review_oracle2_vel   --config experiments/obs_ablation/config_vel.yaml   --n 50
+   uv run --extra learn qc eval outputs/review_oracle2_novel --config experiments/obs_ablation/config_novel.yaml --n 50
+   MUJOCO_GL=egl uv run --extra learn python scripts/drift_test.py outputs/review_oracle2_novel data/expert_v2 --config experiments/obs_ablation/config_novel.yaml
    ```
    Read: `novel` clearly above `vel` on level 1, and its drift no longer growing with re-planning → retrain the
    camera policy without velocity (next point). No difference → velocity is a symptom, not the cause; then try
