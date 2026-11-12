@@ -1,0 +1,110 @@
+# Observation ablation on the scripted-expert takes (experiments/obs_ablation/README.md): no cameras, true brick
+# poses instead (state oracle), observation.state WITHOUT joint velocities, with the hand wrench.
+# = experiments/expert_dagger/config.yaml with only `learn` changed.
+sim:
+  physics_dt: 0.002
+  control_hz: 50
+  table_height: 0.75
+  arm_spacing: 0.6
+  arm_base_x: -0.05
+  gripper_force: 40
+teleop:
+  mode: controllers
+  scale: 1.0
+  pinch_open_m: 0.08
+  pinch_closed_m: 0.015
+  filter_min_cutoff: 1.5
+  filter_beta: 0.5
+  workspace_min:
+  - 0.05
+  - -0.65
+  - 0.755
+  workspace_max:
+  - 0.95
+  - 0.65
+  - 1.45
+ik:
+  position_cost: 1.0
+  orientation_cost: 0.6
+  posture_cost: 0.01
+  max_joint_vel: 2.5
+  max_lead: 0.15
+  damping_cost: 0.1
+  avoid_arm_collisions: false
+  collision_margin: 0.03
+  iterations: 2
+record:
+  out_dir: data/expert_v2
+  countdown_s: 3
+  cameras:
+  - cam_high
+  - cam_low
+  - cam_left_wrist
+  - cam_right_wrist
+  operator: operator
+  action_noise: 0.0
+server:
+  host: 0.0.0.0
+  port: 8000
+  https_port: 8443
+  cert_dir: certs
+curate:
+  include_failures: false
+  max_link_table_frac: 0.01
+  max_arm_arm_frac: 0.0
+  max_tip_table_frac: 0.3
+  cut_contacts:
+  - link_table
+  - arm_arm
+  contact_margin_s: 0.2
+  trim_idle: true
+  dagger_frames: operator
+  until_level: 1
+learn:
+  cameras: []
+  image_size:
+  - 240
+  - 320
+  action: joint
+  env_state: true
+  joint_vel: false
+  ee_wrench: true
+  action_label: executed
+  datasets_dir: data/lerobot
+  runs_dir: outputs
+  presets:
+    dp_state1:
+      policy.type: diffusion
+      policy.device: cuda
+      policy.use_amp: true
+      policy.n_obs_steps: 1
+      policy.horizon: 64
+      policy.n_action_steps: 16
+      policy.drop_n_last_frames: 48
+      policy.down_dims:
+      - 256
+      - 512
+      - 1024
+      policy.noise_scheduler_type: DDIM
+      policy.num_train_timesteps: 100
+      policy.num_inference_steps: 10
+      policy.push_to_hub: false
+      policy.normalization_mapping:
+        VISUAL: MEAN_STD
+        STATE: MIN_MAX
+        ACTION: MIN_MAX
+        ENV: MIN_MAX
+      batch_size: 64
+      num_workers: 4
+      steps: 20000
+      save_freq: 10000
+      tolerance_s: 0.001
+safety:
+  enabled: true
+  arm_margin: 0.02
+  table_margin: 0.01
+  finger_table_margin: 0.005
+control:
+  mode: teleop
+  policy: null
+  n_action_steps: 10
