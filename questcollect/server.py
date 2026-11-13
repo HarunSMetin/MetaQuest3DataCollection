@@ -23,6 +23,7 @@ from questcollect.runtime import Runtime
 log = logging.getLogger(__name__)
 WEB_DIST = ROOT / "web" / "dist"
 SEND_PERIOD_S = 0.01
+EVAL_PREFIX = "eval/"  # dataset names of policy rollouts: eval/<run>/<time> = <runs_dir>/<run>/eval/<time> (read-only)
 STATUS_PERIOD_S = 0.1
 
 
@@ -74,9 +75,15 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     def _dataset_dir(dataset: str | None) -> Path:
         """An episode folder by name: the recording folder (record.out_dir) by default, else a sibling folder of it
-        (e.g. data/episodes_generated, data/mix_parallel)."""
+        (e.g. data/episodes_generated, data/mix_parallel), or a policy evaluation's rollouts (eval/<run>/<time>)."""
         if not dataset or dataset == runtime.cfg.out_dir.name:
             return runtime.cfg.out_dir
+        if dataset.startswith(EVAL_PREFIX):
+            parts = dataset[len(EVAL_PREFIX):].split("/")
+            d = runtime.cfg.runs_dir / parts[0] / "eval" / parts[-1]
+            if len(parts) != 2 or any(not p or p.startswith(".") for p in parts) or not d.is_dir():
+                raise HTTPException(404, "unknown dataset")
+            return d
         name = Path(dataset).name
         d = runtime.cfg.out_dir.parent / name
         if not name or name.startswith(".") or not d.is_dir():
@@ -109,11 +116,36 @@ def create_app(runtime: Runtime) -> FastAPI:
                         info = json.loads((d / "dataset.json").read_text())
                     except ValueError:
                         pass
-                out.append({"name": d.name, "recording": d == rec, "count": len(files),
+                out.append({"name": d.name, "recording": d == rec, "count": len(files), "readonly": False,
                             "title": info.get("title", "Recorded demos" if d == rec else d.name),
                             "description": info.get("description", "")})
-            return out
+            return out + _eval_folders()
         return await asyncio.to_thread(run)
+
+    def _eval_folders() -> list[dict]:
+        """Saved policy rollouts (qc eval), newest first: replay a failure and take over where it went wrong."""
+        runs = runtime.cfg.runs_dir
+        if not runs.is_dir():
+            return []
+        out = []
+        for d in sorted(runs.glob("*/eval/*"), key=lambda d: d.name, reverse=True):
+            files = episode_files(d) if d.is_dir() else []
+            if not files:
+                continue
+            run = d.parent.parent.name
+            desc = ""
+            try:
+                s = json.loads((d / "metrics.json").read_text())["summary"]
+                stages = " · ".join(f"{k.replace('_', ' ')} {100 * v:.0f}%" for k, v in s.get("stage_rates", {}).items())
+                desc = f"Policy rollouts (read-only) · success {100 * s['success_rate']:.0f}% · {stages}"
+            except (OSError, ValueError, KeyError, TypeError):
+                desc = "Policy rollouts (read-only)"
+            out.append({"name": f"{EVAL_PREFIX}{run}/{d.name}", "recording": False, "count": len(files),
+                        "readonly": True, "title": f"Rollouts · {run} · {d.name}", "description": desc})
+        return out
+
+    def _readonly(dataset: str | None) -> bool:
+        return bool(dataset) and dataset.startswith(EVAL_PREFIX)
 
     @app.get("/api/episodes")
     async def episodes(dataset: str | None = None):
@@ -130,6 +162,8 @@ def create_app(runtime: Runtime) -> FastAPI:
     @app.patch("/api/episodes/{file}")
     async def edit_episode(file: str, body: dict, dataset: str | None = None):
         """Change an episode's manual labels: any of exclude, note, tags, success (null = as recorded)."""
+        if _readonly(dataset):
+            raise HTTPException(403, "policy rollouts are read-only")
         p = _episode_file(file, dataset)
         fields = {k: v for k, v in body.items() if k in CURATION_FIELDS}
         if "note" in fields:
@@ -153,7 +187,7 @@ def create_app(runtime: Runtime) -> FastAPI:
         null)."""
         def run():
             folder = _dataset_dir(dataset)
-            audits = audit_dir(folder)
+            audits = audit_dir(folder, cache=not _readonly(dataset))
             curation = load_curation(folder)
             rules = runtime.cfg.curate
 

@@ -184,3 +184,87 @@ def test_replay_pause_seek_and_hold(rt, tmp_path):
     rt.command("record_toggle")
     _ticks(rt, 2)
     assert rt._replay is None and rt.recorder.recording
+
+
+def test_take_over_from_a_replayed_frame(rt, tmp_path):
+    """"Take over here": the new take starts at exactly the replayed state, the scene holds still through the
+    countdown, and the file says where it came from."""
+    from questcollect.recorder import read_episode
+
+    rt.recorder.out_dir = tmp_path
+    rt.cfg.record.countdown_s = 0
+    rt.control_mode = "policy"  # something that moves the arms
+    rt.command("record_toggle")
+    _ticks(rt, 40)
+    rt.command("save", success=False)
+    _ticks(rt, 1)
+    rt.recorder.flush()
+    src = str(next(tmp_path.glob("episode_*.hdf5")))
+    _, data = read_episode(src, keys=["sim/state"])
+
+    rt.control_mode = "teleop"
+    rt.command("replay", path=src, paused=True, i=20)
+    _ticks(rt, 2)
+    rt._replay["meta"]["scene_hash"] = "another scene"  # recorded elsewhere: may be replayed, not continued
+    rt.command("replay_branch")
+    _ticks(rt, 2)
+    assert rt._replay is not None and rt._branch is None and rt.recorder.state.value == "idle"
+    rt._replay["meta"]["scene_hash"] = rt.env.scene_hash
+
+    rt.cfg.record.countdown_s = 0.5
+    t = time.monotonic()
+    rt.command("replay_branch")
+    for k in range(10):  # 0.2 s of the countdown: the scene holds at the frame
+        rt.submit_input(_controllers())
+        rt._tick(t + 0.02 * k)
+    assert rt._replay is None and rt.recorder.state.value == "countdown"
+    assert rt.status()["branch"] == {"of": src, "step": 20, "frozen": True}
+    assert np.array_equal(rt.env.get_state(), data["sim/state"][20])
+    for k in range(30):
+        rt.submit_input(_controllers())
+        rt._tick(t + 0.6 + 0.02 * k)
+    assert rt.recorder.recording and not rt._branch["frozen"]
+    rt.command("save", success=False)
+    _ticks(rt, 1)
+    rt.recorder.flush()
+    new = sorted(tmp_path.glob("episode_*.hdf5"))[-1]
+    meta, out = read_episode(new, keys=["sim/state"])
+    assert meta["branch_of"] == src and meta["branch_step"] == 20
+    assert np.array_equal(out["sim/state"][0], data["sim/state"][20])
+    assert rt._branch is None  # the next take is a fresh one
+
+
+def test_policy_rollouts_are_listed_read_only(rt, tmp_path):
+    """Saved eval rollouts (outputs/<run>/eval/<time>) show up as datasets to replay and take over from; labels
+    can't be changed there and nothing is written into the folder."""
+    from fastapi.testclient import TestClient
+
+    from questcollect.server import create_app
+
+    rec, runs = tmp_path / "data" / "episodes", tmp_path / "outputs"
+    rec.mkdir(parents=True)
+    rt.recorder.out_dir = rec
+    rt.cfg.record.out_dir, rt.cfg.learn.runs_dir = str(rec), str(runs)
+    rt.cfg.record.countdown_s = 0
+    rt.command("record_toggle")
+    _ticks(rt, 20, _controllers())
+    rt.command("save", success=False)
+    _ticks(rt, 1)
+    rt.recorder.flush()
+    ev = runs / "run1" / "eval" / "20261113-120000"
+    ev.mkdir(parents=True)
+    next(rec.glob("episode_*.hdf5")).rename(ev / "episode_000000.hdf5")
+    (ev / "metrics.json").write_text('{"summary": {"success_rate": 0.0, "stage_rates": {"base_in_area": 0.5}}}')
+    before = sorted(p.name for p in ev.iterdir())
+
+    client = TestClient(create_app(rt))
+    rows = client.get("/api/datasets").json()
+    ds = next(d for d in rows if d["readonly"])
+    assert ds["name"] == "eval/run1/20261113-120000" and ds["count"] == 1 and "base in area 50%" in ds["description"]
+    eps = client.get("/api/episodes", params={"dataset": ds["name"]}).json()
+    assert [e["file"] for e in eps] == ["episode_000000.hdf5"]
+    assert client.get("/api/audit", params={"dataset": ds["name"]}).status_code == 200
+    r = client.patch("/api/episodes/episode_000000.hdf5", params={"dataset": ds["name"]}, json={"note": "x"})
+    assert r.status_code == 403
+    assert client.get("/api/episodes", params={"dataset": "eval/../x"}).status_code == 404
+    assert sorted(p.name for p in ev.iterdir()) == before  # no audit cache, no curation.json

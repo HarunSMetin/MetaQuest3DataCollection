@@ -25,7 +25,8 @@ from questcollect.recorder import (SOURCE_OPERATOR, SOURCE_POLICY, Recorder, Rec
                                    read_episode, snapshot, teleop_fields)
 from questcollect.safety import SafetyFilter
 from questcollect.scene_export import body_poses, export_scene
-from questcollect.sim import ARMS, BRICKS, INSTRUCTION, LEVELS, TASK, BimanualEnv, CameraRenderer, task_spec
+from questcollect.sim import (ARMS, BRICKS, GRIPPER_CTRL_MAX, INSTRUCTION, LEVELS, TASK, BimanualEnv, CameraRenderer,
+                             load_recorded_model, scene_hash, task_spec)
 from questcollect.teleop import Teleop
 
 log = logging.getLogger(__name__)
@@ -108,6 +109,9 @@ class Runtime:
         self._loop_hz = float(cfg.sim.control_hz)
         self._replay: dict | None = None
         self._replay_speed, self._replay_loop = 1.0, False  # kept across replays (dashboard settings)
+        # Take over from a replayed frame: {"of", "step", "state", "frozen"}; the next take starts at that state
+        # and its file names where it came from (branch_of, branch_step).
+        self._branch: dict | None = None
         self._warn = {"arm_collision": False, "table_collision": False, "ik_saturated": False, "blocked": False}
         self._reach = {a: False for a in ARMS}
         self._engaged = {a: False for a in ARMS}
@@ -216,6 +220,22 @@ class Runtime:
         self.teleop.reset({a: self._ik_pose(a) for a in ARMS})
         self.safety.reset(obs["joint_pos"])
         self._driver = "operator"  # a policy starts a fresh chunk on its first tick
+        self._branch = None
+        self._grip_latch = [None] * len(ARMS)
+        self._dart[:], self._dart_ou[:] = 0.0, 0.0
+
+    def _sync_to_scene(self) -> None:
+        """The scene was set from outside (a replayed frame): IK, safety filter and the held operator targets follow
+        it, without a new task layout."""
+        q = self.env.data.qpos[self.env.arm_qadr].copy()
+        self.ik.reset(q)
+        self.safety.reset(q)
+        self.teleop.reset({a: self._ik_pose(a) for a in ARMS})
+        self._held = self.env.held()
+        self._progress = self.env.progress()
+        self._base_in_area = self.env.in_area()
+        self._complete = self.env.success()
+        self._dart[:], self._dart_ou[:] = 0.0, 0.0
 
     def _ik_pose(self, arm: str) -> tuple[np.ndarray, np.ndarray]:
         p, q = self.ik.tcp_pose(arm)
@@ -266,7 +286,8 @@ class Runtime:
             if was == RecState.IDLE and rec.state == RecState.COUNTDOWN:
                 self._toast("Get ready…")
         elif name == "save":
-            path = rec.save(self.env, self.teleop.mode, kw.get("success"), source=self.control_mode)
+            extra = None if self._branch is None else {"branch_of": self._branch["of"], "branch_step": self._branch["step"]}
+            path = rec.save(self.env, self.teleop.mode, kw.get("success"), source=self.control_mode, extra=extra)
             if path:
                 self._emit({"type": "saved", "path": path})
                 self._toast(f"Saved {path.rsplit('/', 1)[-1]}", "success")
@@ -296,9 +317,11 @@ class Runtime:
             rec.auto_stop = bool(kw.get("enabled", True))
         elif name == "replay":
             if rec.state == RecState.IDLE:
-                _, data = read_episode(kw["path"], keys=["sim/state"])
+                meta, data = read_episode(kw["path"], keys=["sim/state"])
                 states = data["sim/state"]
+                self._branch = None
                 self._replay = {"path": kw["path"], "states": states, "paused": bool(kw.get("paused", False)),
+                                "meta": meta,
                                 "i": int(np.clip(kw.get("i", 0), 0, len(states) - 1)), "acc": 0.0}
         elif name == "replay_pause":
             if self._replay is not None:
@@ -314,6 +337,8 @@ class Runtime:
         elif name == "replay_seek":
             if self._replay is not None:
                 self._replay["i"] = int(np.clip(kw.get("i", 0), 0, len(self._replay["states"]) - 1))
+        elif name == "replay_branch":
+            self._start_branch(now)
         elif name == "replay_stop":
             self._replay = None
             self._reset_scene()
@@ -327,10 +352,56 @@ class Runtime:
                 self._toast({"teleop": "You drive", "policy": "Policy drives",
                              "shared": "Policy drives: take over any time with Grip"}[mode], "info")
 
+    def _start_branch(self, now: float) -> None:
+        """Take over from the replayed frame: the scene stays at that state through the countdown, and the take
+        records the operator's correction from exactly there (recovery data; DAgger from a failed take or rollout)."""
+        r, rec = self._replay, self.recorder
+        if r is None or rec.state != RecState.IDLE:
+            return
+        meta = r["meta"]
+        want = meta.get("scene_hash") or scene_hash(load_recorded_model(meta["model_xml"]))
+        if want != self.env.scene_hash:
+            self._toast("This episode was recorded in a different scene: it can be replayed, not continued", "warn")
+            return
+        state = np.array(r["states"][r["i"]])
+        self._replay = None
+        self.env.set_state(state)
+        self._sync_to_scene()
+        # Each gripper keeps its command at that frame (a held brick stays held) until its Trigger matches it.
+        self._grip_latch = [float(g) for g in self.env.data.ctrl[self.env.grip_act] / GRIPPER_CTRL_MAX]
+        self._branch = {"of": r["path"], "step": int(r["i"]), "state": state, "frozen": True}
+        rec.start(now)
+        self._toast(f"Taking over at {r['i'] / self.cfg.sim.control_hz:.1f} s: get ready…")
+
+    def _hold_branch(self, now: float) -> bool:
+        """Countdown of a take-over: hold the scene at the branch state (True = this tick is done)."""
+        b = self._branch
+        if b is None or not b["frozen"]:
+            return False
+        if self.recorder.state == RecState.COUNTDOWN and now < self.recorder.countdown_end:
+            self.env.set_state(b["state"])
+            with self._input_lock:
+                frame = self._input
+            out = self.teleop.update(frame, now, self.dt)  # only for the buttons (Cancel); the arms stay put
+            for cmd in out.commands:
+                self._handle(cmd, {}, now)
+            if self._branch is not None and self._branch["frozen"]:
+                self.teleop.reset({a: self._ik_pose(a) for a in ARMS})
+            self._publish(now, None)
+            return True
+        b["frozen"] = False
+        if self.recorder.state == RecState.IDLE:  # countdown cancelled: a live scene at that state, no take
+            self._branch = None
+        self.env.set_state(b["state"])
+        self._sync_to_scene()
+        return False
+
     def _tick(self, now: float) -> None:
         self._process_commands(now)
         self._tick_count += 1
         env = self.env
+        if self._hold_branch(now):
+            return
 
         if self._replay is not None:
             r = self._replay
@@ -587,6 +658,8 @@ class Runtime:
                         "policy": None if self.policy is None else self.policy.name,
                         "safety_rad": round(self._safety_rad, 3)},
             "review": self._review_summary(),
+            "branch": None if self._branch is None else {"of": self._branch["of"], "step": self._branch["step"],
+                                                          "frozen": self._branch["frozen"]},
             "replay": None if self._replay is None else {
                 "path": self._replay["path"], "i": self._replay["i"], "n": len(self._replay["states"]),
                 "paused": self._replay["paused"], "speed": self._replay_speed, "loop": self._replay_loop},

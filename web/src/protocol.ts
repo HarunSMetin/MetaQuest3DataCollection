@@ -135,6 +135,8 @@ export interface Status {
   connected: boolean;
   placement: number[]; // column-major 4x4, world -> xr
   replay: { path: string; i: number; n: number; paused: boolean; speed: number; loop: boolean } | null;
+  /** This take continues a replayed episode from that step ("Take over here"); frozen = still in the countdown. */
+  branch?: { of: string; step: number; frozen: boolean } | null;
   /** The take under review, judged by the curation rules (`qc audit`): null outside review. */
   review: {
     duration_s: number;
@@ -191,6 +193,9 @@ export interface EpisodeRow {
   origin: string | null;
   generation: { seed: number; tower_yaw_deg: number; base_shift_m: number[]; spawn_jitter_m: number; spawn_yaw_deg: number } | null;
   retime_moves: number | null; // retimed: pieces that start earlier than recorded
+  /** Taken over from a replayed episode (its path) at this step ("Take over here"); null otherwise. */
+  branch_of: string | null;
+  branch_step: number | null;
   /** Manual labels (curation.json), edited with PATCH /api/episodes/<file>. */
   tags: string[];
   note: string;
@@ -201,6 +206,7 @@ export interface EpisodeRow {
 export interface DatasetRow {
   name: string;
   recording: boolean; // record.out_dir: new takes land here; the only folder where episodes can be deleted
+  readonly: boolean; // policy rollouts (eval/<run>/<time>, in outputs/): replay and take over only, no labels
   count: number;
   title: string;
   description: string;

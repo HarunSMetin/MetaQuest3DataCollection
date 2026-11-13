@@ -231,6 +231,7 @@ button.tag { cursor: pointer; }
 .seg.speed { margin-left: auto; grid-template-columns: repeat(5, auto); gap: 2px; }
 .seg.speed button { padding: 3px 8px; font-variant-numeric: tabular-nums; }
 .replay-controls .close { margin-left: 4px; }
+.replay-controls .takeover { margin-left: 4px; white-space: nowrap; }
 .scrub { position: relative; height: 22px; display: flex; align-items: center; }
 .scrub::before { content: ""; position: absolute; left: 0; right: 0; height: 6px; border-radius: 3px; background: rgba(255,255,255,0.08); }
 .scrub .fill { position: absolute; left: 0; height: 6px; border-radius: 3px; background: var(--accent); }

@@ -54,7 +54,8 @@ export function EpisodeBrowser({ episodes, audit, selected, onSelect, onEdit, on
         </select>
       </label>
       {ds?.description && <p className="muted small">{ds.description}</p>}
-      <code className="muted small">data/{dataset}</code>
+      <code className="muted small">{ds?.readonly ? `outputs/${dataset.split("/")[1]}/eval/${dataset.split("/")[2]}` : `data/${dataset}`}</code>
+      {ds?.readonly && <p className="muted small">Replay a failure, pause where it went wrong and press <b>Take over here</b>: your correction is recorded as a new take in the recording folder.</p>}
     </div>
   );
   if (!rows.length && !ds?.recording && datasets.length) {
@@ -101,7 +102,7 @@ export function EpisodeBrowser({ episodes, audit, selected, onSelect, onEdit, on
                 <span className={`badge ${e.success ? "ok" : "warn"}`} title={e.success ? "Success" : "Failure"}>{e.success ? "✓" : "✗"}</span>
                 <span className="ep-main">
                   <b>{epNumber(e.file)}</b>
-                  <span className="muted">{e.duration_s?.toFixed(1)} s · {e.origin ? `from ${originLabel(e.origin)}` : fmtDate(e.created_at)}</span>
+                  <span className="muted">{e.duration_s?.toFixed(1)} s · {e.origin ? `from ${originLabel(e.origin)}` : e.branch_of ? `↳ ${originLabel(e.branch_of)}` : fmtDate(e.created_at)}</span>
                 </span>
                 <span className="ep-tags">
                   {e.note && <i title={e.note}>✎</i>}
@@ -113,16 +114,16 @@ export function EpisodeBrowser({ episodes, audit, selected, onSelect, onEdit, on
             );
           })}
         </div>
-        <div className="keys muted"><kbd>↑</kbd><kbd>↓</kbd> episode · <kbd>Space</kbd> play · <kbd>←</kbd><kbd>→</kbd> ±1 s · <kbd>,</kbd><kbd>.</kbd> frame · <kbd>[</kbd><kbd>]</kbd> speed</div>
+        <div className="keys muted"><kbd>↑</kbd><kbd>↓</kbd> episode · <kbd>Space</kbd> play · <kbd>←</kbd><kbd>→</kbd> ±1 s · <kbd>,</kbd><kbd>.</kbd> frame · <kbd>[</kbd><kbd>]</kbd> speed · <kbd>T</kbd> take over</div>
       </div>
-      {selected && <EpisodeDetail key={selected.file} ep={selected} audit={audit} task={task} allTags={allTags} onEdit={onEdit}
+      {selected && <EpisodeDetail key={selected.file} ep={selected} audit={audit} task={task} allTags={allTags} onEdit={onEdit} readonly={!!ds?.readonly}
         onDelete={ds?.recording ? onDelete : null} />}
     </>
   );
 }
 
-function EpisodeDetail({ ep, audit, task, allTags, onEdit, onDelete }: {
-  ep: EpisodeRow; audit: AuditRows; task: TaskSpec | null; allTags: string[];
+function EpisodeDetail({ ep, audit, task, allTags, onEdit, onDelete, readonly }: {
+  ep: EpisodeRow; audit: AuditRows; task: TaskSpec | null; allTags: string[]; readonly: boolean;
   onEdit: (e: EpisodeRow, edit: EpisodeEdit) => void; onDelete: ((e: EpisodeRow) => void) | null;
 }) {
   const a = audit[ep.file];
@@ -139,6 +140,11 @@ function EpisodeDetail({ ep, audit, task, allTags, onEdit, onDelete }: {
       <div className="muted meta-line">
         {fmtDate(ep.created_at)} · {ep.source === "teleop" ? (ep.input_mode === "hands" ? "✋ hands" : "🎮 controllers") : SOURCE_LABEL[ep.source] ?? ep.source} · {ep.operator} · {ep.duration_s?.toFixed(1)} s
       </div>
+      {ep.branch_of && (
+        <div className="muted small origin" title={ep.branch_of}>
+          ↳ Taken over from <b>{originLabel(ep.branch_of)}</b> at {((ep.branch_step ?? 0) / (a?.fps ?? 50)).toFixed(1)} s
+        </div>
+      )}
       {ep.origin && (
         <div className="muted small origin" title={ep.origin}>
           {ep.source === "retimed" ? "Retimed" : "Generated"} from <b>{originLabel(ep.origin)}</b>
@@ -147,6 +153,7 @@ function EpisodeDetail({ ep, audit, task, allTags, onEdit, onDelete }: {
         </div>
       )}
       <dl>
+        {!readonly && <>
         <dt>Outcome</dt>
         <dd>
           <div className="seg mini">
@@ -161,6 +168,7 @@ function EpisodeDetail({ ep, audit, task, allTags, onEdit, onDelete }: {
           {use === "skipped" && <span className="muted small">{a?.verdict}</span>}
           <button className="btn ghost small" onClick={() => onEdit(ep, { exclude: !ep.excluded })}>{ep.excluded ? "Include again" : "Exclude"}</button>
         </dd>
+        </>}
         {a && (
           <>
             <dt>Quality</dt>
@@ -177,6 +185,7 @@ function EpisodeDetail({ ep, audit, task, allTags, onEdit, onDelete }: {
             </dd>
           </>
         )}
+        {!readonly && <>
         <dt>Tags</dt>
         <dd><TagEditor tags={ep.tags} known={allTags} onChange={(tags) => onEdit(ep, { tags })} /></dd>
         <dt>Note</dt>
@@ -184,6 +193,7 @@ function EpisodeDetail({ ep, audit, task, allTags, onEdit, onDelete }: {
           <textarea rows={2} placeholder="Anything worth remembering about this take" value={note}
             onChange={(e) => setNote(e.target.value)} onBlur={() => note !== ep.note && onEdit(ep, { note })} />
         </dd>
+        </>}
       </dl>
     </div>
   );
@@ -255,6 +265,8 @@ export function ReplayBar({ status, ep, audit, task, cmd }: {
           ))}
         </div>
         <button className={`icon-btn ${r.loop ? "on" : ""}`} title={r.loop ? "Looping: on" : "Loop: off"} onClick={() => cmd("replay_options", { loop: !r.loop })}>⟳</button>
+        <button className="btn small takeover" title="Start a new take from this exact frame and record your correction (T)"
+          onClick={() => cmd("replay_branch")}>✋ Take over here</button>
         <button className="btn ghost small close" title="Close the replay and go back to a live scene" onClick={() => cmd("replay_stop")}>✕ Close</button>
       </div>
     </div>

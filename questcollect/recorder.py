@@ -8,6 +8,8 @@ meta (file attrs): schema_version, task, instruction, operator, input_mode, succ
                    created_at, duration_s, num_steps, model_xml, config_yaml, camera_names, objects,
                    tower (JSON: bricks bottom-up with studs/height/color/mass, per-level offsets, clutch
                    pairs and limits), scene_hash (sim.scene_hash; v5+), source (teleop | policy | shared; v5+)
+optional:          branch_of, branch_step: a take that took over from a replayed episode (its path) at that step;
+                   sim/state[0] is that episode's sim/state[branch_step]
 
 /time                         (T,)        sim time [s]
 /wall_time                    (T,)        host monotonic time [s]
@@ -237,6 +239,8 @@ def list_episodes(out_dir: Path) -> list[dict]:
             "origin": m.get("retimed_from") or m.get("generated_from"),
             "generation": _json_attr(m.get("generation")),
             "retime_moves": len(_json_attr(m["retime_moves"])) if "retime_moves" in m else None,
+            # Taken over from a replayed episode at this step (Episodes tab: "Take over here").
+            "branch_of": m.get("branch_of"), "branch_step": m.get("branch_step"),
         })
     return rows
 
@@ -324,8 +328,10 @@ class Recorder:
         self._clear()
         return True
 
-    def save(self, env, teleop_mode: str, success: bool | None = None, source: str = "teleop") -> str | None:
-        """Write the take in the background. success=None uses whether the task check ever passed."""
+    def save(self, env, teleop_mode: str, success: bool | None = None, source: str = "teleop",
+             extra: dict | None = None) -> str | None:
+        """Write the take in the background. success=None uses whether the task check ever passed; extra = more file
+        attributes (branch_of, branch_step)."""
         if self.state == RecState.RECORDING:
             self.stop()
         if self.state != RecState.REVIEW or not self.steps:
@@ -333,6 +339,7 @@ class Recorder:
         path = next_episode_path(self.out_dir)
         meta = episode_meta(self.cfg, env, len(self.steps), self.success_seen if success is None else bool(success),
                             input_mode=teleop_mode, operator=self.cfg.record.operator, source=source)
+        meta.update(extra or {})
         self._pending = self._writer.submit(write_episode, path, self.steps, meta)
         self.saved_count += 1
         self._clear()

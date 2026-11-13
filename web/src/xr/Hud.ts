@@ -44,8 +44,8 @@ export class Hud {
     // --- state pill ---------------------------------------------------------------
     const pillW = 470, pillH = 120, px = pad, py = pad;
     let label = "READY", color = THEME.ok, sub = s.mode === "controllers" ? "Press A to record" : "Wrist menu → Record";
-    if (s.replay) { label = "REPLAY"; color = THEME.accent; sub = `${s.replay.i} / ${s.replay.n}`; }
-    else if (s.rec_state === "countdown") { label = `${Math.ceil(s.countdown)}`; color = THEME.warn; sub = "Get ready"; }
+    if (s.replay) { label = "REPLAY"; color = THEME.accent; sub = `${s.replay.i} / ${s.replay.n}  ·  menu: take over`; }
+    else if (s.rec_state === "countdown") { label = `${Math.ceil(s.countdown)}`; color = THEME.warn; sub = s.branch ? "Taking over: get ready" : "Get ready"; }
     else if (s.rec_state === "recording") { label = `REC ${fmtTime(s.elapsed)}`; color = THEME.rec; sub = `${s.steps} steps`; }
     else if (s.rec_state === "review") {
       label = s.success_seen ? "SUCCESS" : "REVIEW"; color = s.success_seen ? THEME.ok : THEME.warn;

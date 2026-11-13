@@ -124,6 +124,9 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   after success) plus HDF5 read/write; the file layout is documented in its module docstring. Images are never
   recorded: full `sim/state` per step lets the exporter re-render cameras at any resolution. `action/joint_pos` uses
   the ALOHA/ACT layout `[7 left, left grip, 7 right, right grip]`, grip 0 = closed, 1 = open.
+  "Take over here" (`replay_branch`, `Runtime._start_branch`/`_hold_branch`) starts a take at a replayed frame of
+  any same-scene episode, incl. eval rollouts (listed read-only as `eval/<run>/<time>`; never write into
+  `outputs/`); the file gets `branch_of`/`branch_step`.
 - **One definition per concept**: contacts = `BimanualEnv.contact_flags` (warnings, recording, audit, eval); arm
   and wrist-camera clearance = `sim.ArmClearance` (generation, retime); a
   recorded step = `recorder.make_step`, one control step (snapshot → apply → record → physics step) =

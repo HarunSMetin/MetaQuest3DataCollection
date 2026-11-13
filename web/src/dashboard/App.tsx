@@ -87,6 +87,10 @@ export function App() {
     if (tab === "episodes" && !selected && rows.length) setSelFile(rows[0].file);
   }, [tab, selected, rows]);
   const idle = status?.rec_state === "idle";  // also (re)loads once the first status arrives or a take ends
+  // A take started from here or the headset (e.g. "Take over here"): its controls are on the Record tab.
+  useEffect(() => {
+    if (tab === "episodes" && status && !idle) switchTab("record");
+  }, [tab, idle, status != null, switchTab]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (tab === "episodes" && selected && idle) cmd("replay", { path: selected.path, paused: true });
   }, [tab, selected?.path, idle, cmd]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -134,6 +138,8 @@ export function App() {
       } else if ((e.key === "," || e.key === ".") && r) {
         if (!r.paused) cmd("replay_pause", { paused: true });
         cmd("replay_seek", { i: r.i + (e.key === "," ? -1 : 1) });
+      } else if (e.key === "t" && r) {
+        cmd("replay_branch");
       } else if ((e.key === "[" || e.key === "]") && r) {
         const k = REPLAY_SPEEDS.findIndex((v) => v >= r.speed - 1e-6);
         const next = REPLAY_SPEEDS[Math.min(REPLAY_SPEEDS.length - 1, Math.max(0, (k < 0 ? REPLAY_SPEEDS.length - 1 : k) + (e.key === "[" ? -1 : 1)))];
@@ -291,12 +297,13 @@ function Cameras({ names }: { names: string[] }) {
 /** What to do next, in one line. */
 function nextStep(s: Status | null, online: boolean): string {
   if (!online || !s) return "The server is offline. Start it with: uv run qc serve";
-  if (s.rec_state === "countdown") return "Get ready…";
+  if (s.rec_state === "countdown") return s.branch ? "Get ready: the scene holds at the frame you took over at…" : "Get ready…";
+  if (s.rec_state === "recording" && s.branch) return "Show the correction from here: finish the tower, then save it.";
   if (s.rec_state === "recording") {
     return s.auto_stop ? "Build the tower. Recording stops by itself 1 s after it's finished." : "Build the tower, then press Stop.";
   }
   if (s.rec_state === "review") return "Keep this take? Save it as a success or failure, or discard it.";
-  if (s.replay) return "The scene shows a replay. Starting a recording goes back to the live scene.";
+  if (s.replay) return "The scene shows a replay. Take over here (T) continues it as a new take; Start recording goes back to a fresh scene.";
   if (!s.connected) return "Put on the Quest, open this server's address in the Quest Browser and press Enter VR.";
   return "Press Start (or Space). In the headset, squeeze Grip to take hold of an arm.";
 }

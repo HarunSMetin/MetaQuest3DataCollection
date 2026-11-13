@@ -337,9 +337,20 @@ episode.
 For the selected episode you can change its success label, exclude it from training, add tags and a note, or delete
 it. Labels go to `data/episodes/curation.json`; the episode files themselves are never changed.
 The **Dataset** menu at the top switches to any other episode folder under `data/` (retimed or generated takes,
-training mixes, eval rollouts) to replay and label it the same way. Each episode there shows which file it was made
+training mixes) to replay and label it the same way. Each episode there shows which file it was made
 from; deleting is only possible in the recording folder. A folder can carry a `dataset.json`
-(`{"title": ..., "description": ...}`) for the name and text shown in the menu.
+(`{"title": ..., "description": ...}`) for the name and text shown in the menu. The menu also lists every saved
+policy evaluation (`outputs/<run>/eval/<time>`, with its success and stage rates), read-only: replay, no labels.
+
+**Take over here: record a correction from any moment of a replay.** Pause a replay where it goes wrong (a brick
+left on the stud tops, a missed grasp, a policy that stalls) and press **✋ Take over here** (`T` on the dashboard,
+or the wrist menu's big button in the headset, which turns into "Take over here" during a replay). The scene stays
+frozen at exactly that frame through the countdown, then you drive from there and save the take as usual. A
+gripper that held a brick keeps holding it until your Trigger is brought to the same opening. The new episode goes
+to the recording folder and starts at that frame's state (`sim/state[0]` = the source's `sim/state[branch_step]`);
+its file names the source (`branch_of`, `branch_step`) and the Episodes tab shows "↳ taken over from …". This is
+how to collect recovery data from real mistakes, your own or a policy's (offline DAgger), without staging them.
+It works for episodes recorded in today's scene (`scene_hash`); older ones can be replayed but not continued.
 
 ### 5. Train and evaluate a policy
 

@@ -94,13 +94,14 @@ export class WristMenu {
         { icon: () => "✋", active: () => s()?.mode === "hands" }),
 
       // recording
+      // During a replay: continue it from the shown frame as a new take (the operator's correction).
       button("rec", m, 294, CW - 2 * m, 120,
-        () => (rec() === "recording" ? "Stop" : rec() === "countdown" ? "Cancel" : "Record"),
-        () => cmd("record_toggle"),
+        () => (rec() === "recording" ? "Stop" : rec() === "countdown" ? "Cancel" : s()?.replay ? "Take over here" : "Record"),
+        () => cmd(s()?.replay && rec() === "idle" ? "replay_branch" : "record_toggle"),
         {
-          icon: () => (rec() === "recording" ? "■" : "●"), color: () => THEME.rec,
+          icon: () => (rec() === "recording" ? "■" : s()?.replay && rec() === "idle" ? "✋" : "●"), color: () => THEME.rec,
           active: () => rec() === "recording" || rec() === "countdown",
-          enabled: () => rec() !== "review" && !s()?.replay,
+          enabled: () => rec() !== "review",
         }),
       button("save-ok", c3(0), 430, col3, 96, () => "Success", () => cmd("save", { success: true }),
         { icon: () => "✓", color: () => THEME.ok, enabled: canSave }),

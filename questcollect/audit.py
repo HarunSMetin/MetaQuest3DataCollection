@@ -112,21 +112,22 @@ def audit_arrays(file: str, fps: int, success: bool, data: dict) -> EpisodeAudit
     )
 
 
-def audit_dir(episodes_dir: Path, progress=None) -> dict[str, EpisodeAudit]:
-    """Audits of every episode in a folder, from the cache where the file hasn't changed since."""
+def audit_dir(episodes_dir: Path, progress=None, cache: bool = True) -> dict[str, EpisodeAudit]:
+    """Audits of every episode in a folder, from the cache where the file hasn't changed since (cache=False:
+    don't write it, for read-only folders such as policy rollouts in outputs/)."""
     episodes_dir = Path(episodes_dir)
     cache_path = episodes_dir / CACHE_NAME
-    cache = {}
+    write_cache, cached = cache, {}
     if cache_path.exists():
         raw = json.loads(cache_path.read_text())
         if raw.get("version") == AUDIT_VERSION:
-            cache = raw["episodes"]
+            cached = raw["episodes"]
     envs: dict = {}
     out, fresh = {}, {}
     for path in episode_files(episodes_dir):
         st = path.stat()
         key = [st.st_size, st.st_mtime]
-        entry = cache.get(path.name)
+        entry = cached.get(path.name)
         if entry and entry["key"] == key:
             a = EpisodeAudit(**entry["audit"])
             a.active = tuple(a.active)
@@ -138,7 +139,7 @@ def audit_dir(episodes_dir: Path, progress=None) -> dict[str, EpisodeAudit]:
             a = audit_episode(path, envs)
         out[path.name] = a
         fresh[path.name] = {"key": key, "audit": asdict(a)}
-    if json.loads(json.dumps(fresh)) != cache:  # compared as JSON: tuples come back from the file as lists
+    if write_cache and json.loads(json.dumps(fresh)) != cached:  # as JSON: tuples come back from the file as lists
         cache_path.write_text(json.dumps({"version": AUDIT_VERSION, "episodes": fresh}, indent=1))
     return out
 

@@ -71,6 +71,14 @@ state with `BimanualEnv.set_state`. The dashboard's replay can start paused at a
 tick, `REPLAY_SPEED_RANGE`) and looping for this and later replays; without loop it holds the last frame until
 `replay_stop`, and `record_toggle` ends it (back to a fresh live scene).
 
+`replay_branch` ("Take over here") continues the replay from its current frame as a new take
+(`Runtime._start_branch`): refused unless the episode's `scene_hash` is today's; else the state is set, IK,
+safety filter, held operator targets and task bookkeeping follow it (`_sync_to_scene`), each gripper is latched to
+its command at that frame (the same latch as a policy takeover, released when the Trigger matches), and the
+countdown starts. During the countdown `_hold_branch` re-sets that state every tick (teleop runs only for its
+buttons, so Cancel works), so the first recorded `sim/state` is exactly the source frame. Saving adds the file
+attributes `branch_of` (source path) and `branch_step`; `status.branch` = `{of, step, frozen}` while it lasts.
+
 ## Threads and who owns what
 
 | Thread | Owns | Talks to the others through |
@@ -90,10 +98,10 @@ Rule: the server never touches simulation state directly. Anything that changes 
 | `GET /api/scene`, `/api/scene.bin` | → browser | visual geometry: bodies, geoms, materials (JSON) + mesh vertices/faces (binary) |
 | `GET /api/task` | → browser | the goal as data: bricks, where each goes, the build area (`sim.task_spec()`) |
 | `GET /api/status` | → browser | the latest status dict (same as on the websockets) |
-| `GET /api/datasets` | → browser | episode folders: `record.out_dir` first, then every sibling folder with `episode_*.hdf5` files (`name`, `count`, `recording`, `title`/`description` from an optional `dataset.json`) |
-| `GET /api/episodes` | → browser | saved episodes with their manual labels from `curation.json` (`success` = label, `recorded_success` = as saved, `tags`, `note`, `excluded`) and provenance (`origin` = `retimed_from`/`generated_from`, `generation`, `retime_moves`). `?dataset=<folder>` (also on PATCH and audit) picks a sibling folder of `record.out_dir` |
-| `PATCH /api/episodes/<file>`, `DELETE /api/episodes/<file>` | → server | change labels (`exclude`, `note`, `tags`, `success`; null = as recorded) via `audit.update_curation` in that folder's `curation.json` / delete the file and its labels (recording folder only: 403 for any other dataset) |
-| `GET /api/audit` | → browser | per-episode audit: contact shares and events, idle share, level times, and why a dataset would skip it (same reasons as `audit.select`) |
+| `GET /api/datasets` | → browser | episode folders: `record.out_dir` first, then every sibling folder with `episode_*.hdf5` files (`name`, `count`, `recording`, `readonly`, `title`/`description` from an optional `dataset.json`), then saved policy rollouts as `eval/<run>/<time>` (`learn.runs_dir`; `readonly`, description from `metrics.json`) |
+| `GET /api/episodes` | → browser | saved episodes with their manual labels from `curation.json` (`success` = label, `recorded_success` = as saved, `tags`, `note`, `excluded`) and provenance (`origin` = `retimed_from`/`generated_from`, `generation`, `retime_moves`; `branch_of`/`branch_step` for a take-over). `?dataset=<folder>` (also on PATCH and audit) picks a sibling folder of `record.out_dir` or `eval/<run>/<time>` |
+| `PATCH /api/episodes/<file>`, `DELETE /api/episodes/<file>` | → server | change labels (`exclude`, `note`, `tags`, `success`; null = as recorded) via `audit.update_curation` in that folder's `curation.json` / delete the file and its labels (recording folder only: 403 for any other dataset; PATCH: 403 for rollouts, nothing is written into `outputs/`) |
+| `GET /api/audit` | → browser | per-episode audit: contact shares and events, idle share, level times, and why a dataset would skip it (same reasons as `audit.select`); for rollouts without writing the `audit.json` cache (`audit_dir(cache=False)`) |
 | `POST /api/command` | → server | `{"name": ..., "args": {...}}`, queued to the sim thread |
 | `GET /api/preview/<cam>.jpg` | → browser | latest camera preview (rendered only while requested) |
 | `WS /ws/xr` | both | headset: binary input frames in; binary pose frames (every tick), JSON status + events out |
@@ -316,7 +324,7 @@ change shows up as a `scene_hash` mismatch warning.
 
 | Command | Covers |
 | --- | --- |
-| `uv run --group dev pytest` | frames, filters, clutch, mappers, protocol round-trip; scene build, brick physics, clicking, grasping, gripper speed, IK, state replay, scene export, recorder, haptics; audit and selection; safety filter; control modes and takeover |
+| `uv run --group dev pytest` | frames, filters, clutch, mappers, protocol round-trip; scene build, brick physics, clicking, grasping, gripper speed, IK, state replay, scene export, recorder, haptics; audit and selection; safety filter; control modes and takeover; take over from a replayed frame; rollouts listed read-only |
 | `MUJOCO_GL=egl uv run --extra learn --group dev pytest` | the above plus `test_learn.py`: tiny episodes → export → a 2-step `lerobot-train` → a short `qc eval` rollout |
 | `cd web && npm run typecheck` | TypeScript |
 | `cd web/e2e && npm test` | an emulated Quest 3 against a running server: controllers, hands, clutch, gripper, record → save (setup at the top of `emulated-quest.mjs`) |
