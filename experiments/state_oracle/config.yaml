@@ -30,17 +30,6 @@ ik:
   avoid_arm_collisions: false
   collision_margin: 0.03
   iterations: 2
-assist:
-  enabled: true
-  radius_m: 0.04
-  full_at_m: 0.012
-  height_m: 0.08
-  max_tilt_deg: 35
-  max_yaw_err_deg: 35
-  close_lock: 0.7
-  table_clearance_m: 0.003
-  max_speed: 0.25
-  max_rot_speed_deg: 90
 record:
   out_dir: data/episodes
   countdown_s: 3

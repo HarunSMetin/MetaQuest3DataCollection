@@ -81,7 +81,7 @@ Compare with the joint-action oracle above: level 1, and the blue brick's xy err
   4.5 mm in z. More denoising steps (DDIM 30/100, DDPM 100) don't help: the fit, not the sampler.
 
 `qc eval --assist` ran the grasp assist on the policy's TCP targets (ee policies, sim only; the option went with the
-assist on 2026-11-03, and the `assist:` block in the configs here is ignored now). On 3 rollouts the
+assist on 2026-11-03, and the configs here lost their unused `assist:` block on 2026-11-13). On 3 rollouts the
 grasp offset drops to 1.2 mm, but the blue brick still lands 6.7 mm off: the placement itself is off.
 
 **Reading:** the action representation was not the problem. Placement relative to the base is not learned to
