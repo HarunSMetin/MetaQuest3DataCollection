@@ -19,6 +19,7 @@ from questcollect.config import Config
 from questcollect.learn.export import git_commit, read_manifest
 
 RUN_MANIFEST = "questcollect_run.json"
+CONSTANT_RANGE = 1e-4  # an input whose whole range in the dataset is below this is treated as constant
 
 
 def _arg(key: str, value) -> str:
@@ -52,12 +53,39 @@ def run_manifest(path: Path) -> dict:
     return json.loads((run_dir(path) / RUN_MANIFEST).read_text())
 
 
+def constant_inputs(data_root: Path) -> dict[str, list[int]]:
+    """Per non-image policy feature, the indices whose range over the whole dataset is (almost) zero.
+
+    LeRobot normalizes with (x - min) / (max - min + eps) or (x - mean) / (std + eps), so such an input is divided by
+    ~0: whatever it does outside the training frames comes out huge. Seen with the brick poses of the state oracles
+    (2026-11-13, experiments/REVIEW_2026-11-12.md V9): bricks the takes never touch have a constant z in the data,
+    but settle by a few mm at the start of an eval episode, which put 11 and 23 into the network instead of -1.
+    """
+    stats = json.loads((Path(data_root) / "meta" / "stats.json").read_text())
+    out = {}
+    for key in ("observation.state", "observation.environment_state", "action"):
+        if key in stats:
+            lo, hi = stats[key]["min"], stats[key]["max"]
+            idx = [i for i, (a, b) in enumerate(zip(lo, hi)) if b - a < CONSTANT_RANGE]
+            if idx:
+                out[key] = idx
+    return out
+
+
 def train(cfg: Config, preset: str, dataset: str, name: str | None = None, extra: list[str] | None = None,
-          dry_run: bool = False) -> Path:
-    """Start lerobot-train for `dataset` (a folder name in learn.datasets_dir) with a preset; returns the run."""
+          dry_run: bool = False, allow_constant_inputs: bool = False) -> Path:
+    """Start lerobot-train for `dataset` (a folder name in learn.datasets_dir) with a preset; returns the run.
+
+    Refuses a dataset with constant inputs (`constant_inputs`) unless `allow_constant_inputs`."""
     if preset not in cfg.learn.presets:
         raise KeyError(f"unknown preset {preset!r}; config learn.presets has {sorted(cfg.learn.presets)}")
     data_root = cfg.datasets_dir / dataset
+    constant = constant_inputs(data_root)
+    if constant and not allow_constant_inputs:
+        raise ValueError(f"{dataset}: inputs constant over the whole dataset (range < {CONSTANT_RANGE}): {constant}. "
+                         "Normalization divides them by ~0, so any change at eval time explodes. Export without "
+                         "them, or pass allow_constant_inputs (qc train --allow-constant-inputs) and keep them "
+                         "constant at eval time (experiments/obs_ablation/diagnostics/e8_eval_pinned.py).")
     manifest = read_manifest(data_root)
     name = name or f"{datetime.now():%Y%m%d-%H%M}_{preset}_{dataset}"
     run = cfg.runs_dir / name

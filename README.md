@@ -716,6 +716,7 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | Laggy over Wi-Fi | Use the USB cable, or move closer to a 5/6 GHz access point. |
 | `qc export` says the dataset already exists | Datasets are never overwritten: pick a new name, or delete `data/lerobot/<name>`. |
 | `qc eval` / `serve --policy`: *not inside a qc train run* | Point it at the run folder `outputs/<run>` made by `qc train` (it holds the dataset settings the policy needs). |
+| `qc train` says *inputs constant over the whole dataset* | An input never varies in the data (e.g. the pose of a brick no take touches). Normalization divides it by ~0, so any change at evaluation time explodes. Export without it, or pass `--allow-constant-inputs` and make sure it stays constant at evaluation. |
 | `EGLError` printed when a command exits | Harmless: MuJoCo's GL context is cleaned up after Python has shut down. |
 
 ## Development

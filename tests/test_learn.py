@@ -19,7 +19,7 @@ from questcollect.learn.evaluate import evaluate  # noqa: E402
 from questcollect.learn.export import MANIFEST, export  # noqa: E402
 from questcollect.learn.features import FeatureSpec  # noqa: E402
 from questcollect.learn.policy import spec_of  # noqa: E402
-from questcollect.learn.train import checkpoint_dir, train  # noqa: E402
+from questcollect.learn.train import checkpoint_dir, constant_inputs, train  # noqa: E402
 from questcollect.recorder import episode_meta, make_step, read_episode, teleop_fields, write_episode  # noqa: E402
 from questcollect.sim import BimanualEnv  # noqa: E402
 
@@ -78,7 +78,11 @@ def test_export_train_eval(cfg, tmp_path):
     assert np.allclose(item["action"].numpy(), data["action/joint_pos"][0], atol=1e-5)
     assert json.loads((out / MANIFEST).read_text())["features"] == spec.to_dict()
 
-    run = train(cfg, "tiny", "tiny", name="tiny_run")
+    # The tiny takes never move the grippers: their action is constant, which train() refuses by default.
+    assert set(constant_inputs(out)) >= {"action"}
+    with pytest.raises(ValueError, match="constant"):
+        train(cfg, "tiny", "tiny", name="tiny_run")
+    run = train(cfg, "tiny", "tiny", name="tiny_run", allow_constant_inputs=True)
     assert checkpoint_dir(run).exists() and spec_of(checkpoint_dir(run)) == spec  # deployed = trained layout
 
     summary, results = evaluate(run, cfg, n=1, max_steps=15)

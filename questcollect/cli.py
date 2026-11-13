@@ -295,11 +295,13 @@ def train(
     name: Optional[str] = typer.Option(None, help="Run name (default: date_preset_dataset)"),
     config: Optional[Path] = typer.Option(None, help="YAML config (default: config.yaml)"),
     dry_run: bool = typer.Option(False, help="Only print the lerobot-train command"),
+    allow_constant_inputs: bool = typer.Option(False, help="Train even if an input never varies in the dataset"),
 ):
     """Train a policy with lerobot-train. Extra --key=value arguments are passed through to lerobot-train."""
     from questcollect.learn.train import train as train_run
 
-    run = train_run(load_config(config), preset, dataset, name=name, extra=list(ctx.args), dry_run=dry_run)
+    run = train_run(load_config(config), preset, dataset, name=name, extra=list(ctx.args), dry_run=dry_run,
+                    allow_constant_inputs=allow_constant_inputs)
     if not dry_run:
         typer.secho(f"run finished: {run}  ->  qc eval {run}", fg="green")
 
