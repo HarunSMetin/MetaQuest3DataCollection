@@ -458,7 +458,7 @@ the raw weights are kept as `model_raw.safetensors`, +0.4 GB GPU).
 ```bash
 uv run qc eval outputs/<run>                  # last checkpoint, 50 rollouts
 uv run qc eval outputs/<run> --ensemble 0.01  # ACT temporal ensembling (smoother, slower)
-uv run qc eval outputs/<run> --n-action-steps 8  # re-plan more often (diffusion; ACT too)
+uv run qc eval outputs/<run> --n-action-steps 32  # steps executed per predicted chunk (diffusion; ACT too)
 ```
 
 It prints the success rate and how far the tower got (base in the square, levels 1–3), the contacts, and how
@@ -466,7 +466,7 @@ much the safety filter had to correct. Every rollout is saved as a normal episod
 failure); the numbers go to `outputs/<run>/eval/<time>/metrics.json`.
 
 **Overnight: train + evaluate in one go.** `scripts/train_and_eval.sh v1` starts `qc train`, then `qc eval`
-(plain, then with `--ensemble 0.01` for ACT or half the `n_action_steps` for other policies) in the background, keeps the laptop awake (also with the lid closed) and
+(plain, then with `--ensemble 0.01` for ACT or twice the `n_action_steps` for other policies) in the background, keeps the laptop awake (also with the lid closed) and
 writes `outputs/<run>/RESULTS.txt`; follow it with `tail -f outputs/latest.log`. Optional arguments: preset and
 number of rollouts (`scripts/train_and_eval.sh v1 dp_240 50`). To pause: `pkill -f train_and_eval.sh; pkill -f lerobot-train`;
 to continue from the last saved checkpoint (every 20k steps) and evaluate at the end:

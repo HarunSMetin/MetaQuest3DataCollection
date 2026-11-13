@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Unattended run: train a dataset with a preset, then evaluate the last checkpoint (plain, then with ACT temporal
-# ensembling, or for other policies re-planning twice as often) and write a short results file. Detaches from the
+# ensembling, or for other policies with chunks twice as long) and write a short results file. Detaches from the
 # terminal (closing it is fine) and keeps the laptop awake, also with the lid closed, until done.
 #
 #   scripts/train_and_eval.sh <dataset> [preset=act_240] [rollouts=50]
@@ -77,7 +77,13 @@ if [[ $policy == act ]]; then
     stamp "eval: $n rollouts, temporal ensembling 0.01"
     qc eval "$run" --n "$n" --ensemble 0.01 || stamp "eval (ensemble) failed"
 else
-    steps=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['n_action_steps'] // 2)" "$policy_cfg")
+    # Twice as many steps per chunk as trained (up to what the policy predicts). Until 2026-11-12 this was half as
+    # many; re-planning more often scored lower in every run (experiments/REVIEW_2026-11-12.md).
+    steps=$(python3 -c "
+import json, sys
+c = json.load(open(sys.argv[1]))
+longest = c['horizon'] - c['n_obs_steps'] + 1 if c['type'] == 'diffusion' else c.get('chunk_size', c['n_action_steps'])
+print(min(2 * c['n_action_steps'], longest))" "$policy_cfg")
     stamp "eval: $n rollouts, re-planning every $steps steps"
     qc eval "$run" --n "$n" --n-action-steps "$steps" || stamp "eval (n_action_steps $steps) failed"
 fi
