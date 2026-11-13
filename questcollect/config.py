@@ -95,20 +95,9 @@ class LearnConfig(BaseModel):
     action_label: Literal["recorded", "executed"] = "executed"  # train on the targets sent (with the DART drift)
     datasets_dir: str = "data/lerobot"
     runs_dir: str = "outputs"
-    presets: dict[str, dict[str, Any]] = Field(default_factory=lambda: {
-        # Measured on an RTX 4050 6 GB: ~3.6 GB, ~54 samples/s, ~8 h for 100k steps.
-        "act_240": {"policy.type": "act", "policy.device": "cuda", "policy.use_amp": True,
-                    "policy.chunk_size": 100, "policy.n_action_steps": 100, "policy.push_to_hub": False,
-                    "batch_size": 16, "num_workers": 8, "steps": 100_000, "save_freq": 20_000},
-        # Diffusion Policy (experiments/diffusion/README.md): ~5.1 GB, ~76 samples/s, ~9.5 h for 80k steps.
-        "dp_240": {"policy.type": "diffusion", "policy.device": "cuda", "policy.use_amp": True,
-                   "policy.n_obs_steps": 1, "policy.horizon": 64, "policy.n_action_steps": 16,
-                   "policy.drop_n_last_frames": 48, "policy.resize_shape": [240, 320], "policy.crop_ratio": 0.9,
-                   "policy.use_separate_rgb_encoder_per_camera": True, "policy.down_dims": [256, 512, 1024],
-                   "policy.noise_scheduler_type": "DDIM", "policy.num_train_timesteps": 100,
-                   "policy.num_inference_steps": 10, "policy.push_to_hub": False,
-                   "batch_size": 32, "num_workers": 8, "steps": 80_000, "save_freq": 20_000},
-    })
+    # Named lerobot-train argument sets for `qc train --preset`. Written only in the YAML (config.yaml and each
+    # experiment config, with their measured memory and time); a second copy here had already drifted from it.
+    presets: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class SafetyConfig(BaseModel):
