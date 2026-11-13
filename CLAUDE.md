@@ -22,7 +22,7 @@ uv run qc serve [--mode hands] [--config my.yaml] [--no-https]
 uv run qc view | replay <ep.hdf5> | inspect <ep.hdf5>
 uv run qc audit [--exclude ep.hdf5 --note why]       # quality report; cache data/episodes/audit.json
 uv run qc retime [eps...] [--out data/episodes_retimed]  # experimental: overlap the arms' work, re-simulated
-uv run python scripts/generate_set.py data/episodes_generated  # experimental: new layouts from the recorded takes
+uv run qc generate set data/episodes_generated   # experimental: new layouts from the recorded takes (also: take, grasps)
 uv run qc export <name> [--randomize-visuals]          # -> data/lerobot/<name> (+ questcollect_manifest.json)
 uv run qc train <dataset> [--preset act_240] [--dry-run] [--key=value ...]   # -> outputs/<run>/train
 uv run qc eval outputs/<run> [--n 50] [--ensemble 0.01]   # -> outputs/<run>/eval/<time>/metrics.json
@@ -135,10 +135,10 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   (exclude, note, tags, success override = `labelled_success`) only ever go to `curation.json` through
   `audit.update_curation`; episode files are never rewritten. Schema v5 adds
   `contacts` and `control/source`; `audit.py` replays `sim/state` for older files.
-- **Generation + retiming** (experimental; `generate.py`, `retime.py`, `scripts/generate_*.py`): `generate.replay`
+- **Generation + retiming** (experimental; `generate.py`, `retime.py`, `qc generate take|set|grasps`): `generate.replay`
   plays a take's TCP targets through the IK, adapted: picks follow the brick, each brick is placed relative to the
   brick it goes onto *as it is now* plus an in-hand correction (towers slide a few mm under the press, so replaying
-  recorded joints after any change misses), optionally new layouts / per-arm time maps / off-centre grasps (`grasp_shift`, `scripts/generate_grasps.py`). `generate.check` accepts a
+  recorded joints after any change misses), optionally new layouts / per-arm time maps / off-centre grasps (`grasp_shift`, `qc generate grasps`). `generate.check` accepts a
   take (tower built, no new contacts, `sim.ArmClearance`: arms `ARM_CLEAR_M` / wrist cameras `CAM_CLEAR_M` apart,
   or as close as the source came). Retime schedules moves as early as clearance, the
   one-arm tower zone and gripper settle times allow (staging: a move into the zone is split just outside it, so the

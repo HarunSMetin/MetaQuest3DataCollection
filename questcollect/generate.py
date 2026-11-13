@@ -14,21 +14,23 @@ cameras never closer than ARM_CLEAR_M / CAM_CLEAR_M (or than the source came, wh
 
 `generate` samples a new layout for a recorded take and keeps the result if it passes `check`. Source files are
 never changed; results are new episode files with `source = "generated"`, `generated_from` and `generation`.
+`generate_set` (`qc generate set`) and `generate_grasps` (`qc generate grasps`) run it over a folder of takes.
 """
 
 from __future__ import annotations
 
 import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import mujoco
 import numpy as np
 
-from questcollect.audit import CONTACT_KINDS
+from questcollect.audit import CONTACT_KINDS, load_curation
 from questcollect.ik import BimanualIK
-from questcollect.recorder import (AUTO_STOP_TAIL_S, control_step, episode_meta, read_episode, snapshot,
-                                   teleop_fields, write_episode)
+from questcollect.recorder import (AUTO_STOP_TAIL_S, control_step, episode_files, episode_meta, read_episode,
+                                   snapshot, teleop_fields, write_episode)
 from questcollect.sim import (ARM_CLEAR_M, ARMS, BRICKS, CAM_CLEAR_M, SPAWN, SPAWN_JITTER_M, SPAWN_YAW, ArmClearance,
                               BimanualEnv, _quat_yaw, env_from_episode, executed_actions, held_bricks,
                               set_brick_pose)
@@ -436,3 +438,89 @@ def generate(src: Path, seed: int, out_dir: Path | None, identity: bool = False,
             "grasp_shift_m": {BRICKS[i].name: d.tolist() for i, d in grasp_shift.items()}})
         res["path"] = str(write_episode(Path(out_dir) / f"gen_{src.stem}_s{seed}.hdf5", take.steps, m))
     return res
+
+
+# -- whole sets: `qc generate set`, `qc generate grasps` ---------------------------------------------------------
+SET_SEED_BASE = 10_000    # far from the eval seeds (EVAL_SEED_BASE); each source gets its own block of 1000 seeds
+GRASP_SEED_BASE = 70_000  # grasp sets: 100 seeds per source
+
+
+def _set_job(src: str, seed: int, tmp: str, kw: dict) -> dict:
+    return generate(Path(src), seed, Path(tmp), **kw)
+
+
+def generate_set(src_dir: Path, out: Path, per: int = 10, max_tries: int = 30, seed_base: int = SET_SEED_BASE,
+                 jobs: int = 6, **kw) -> dict:
+    """A balanced set: `per` kept takes (new layouts, `generate` options in kw) from each source take.
+
+    Writes episode_XXXXXX.hdf5 (what qc audit / export read) and names.txt (episode -> source, seed, layout).
+    Seeds go in rounds, so every source keeps a few jobs in flight and stops once it has `per` or `max_tries`."""
+    out, tmp = Path(out), Path(out) / "_tmp"
+    sources = episode_files(Path(src_dir))
+    kept = {s.name: [] for s in sources}
+    tries = dict.fromkeys(kept, 0)
+    with ProcessPoolExecutor(jobs) as pool:
+        futs = {}
+
+        def submit(src):
+            if len(kept[src.name]) + sum(f_src == src.name for f_src, _ in futs.values()) >= per \
+                    or tries[src.name] >= max_tries:
+                return
+            seed = seed_base + sources.index(src) * 1000 + tries[src.name]
+            tries[src.name] += 1
+            futs[pool.submit(_set_job, str(src), seed, str(tmp), kw)] = (src.name, seed)
+
+        for _ in range(2):
+            for s in sources:
+                submit(s)
+        while futs:
+            f = next(as_completed(futs))
+            name, _ = futs.pop(f)
+            r = f.result()
+            if r["ok"] and len(kept[name]) < per:
+                kept[name].append(r)
+            elif r.get("path"):
+                Path(r["path"]).unlink()
+            print(f"{name}: {len(kept[name])}/{per} kept, {tries[name]} tried", flush=True)
+            submit(next(s for s in sources if s.name == name))
+    out.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for r in (r for s in sources for r in kept[s.name]):
+        dst = out / f"episode_{len(rows):06d}.hdf5"
+        Path(r["path"]).rename(dst)
+        rows.append({"episode": dst.name, **{k: r[k] for k in ("src", "seed", "tower_yaw_deg", "base_shift_mm",
+                                                               "len_s", "arm_m", "cam_m")}})
+    for p in tmp.glob("*.hdf5"):
+        p.unlink()
+    if tmp.exists():
+        tmp.rmdir()
+    (out / "names.txt").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return {"kept": len(rows), "tried": sum(tries.values()), "per_source": {k: len(v) for k, v in kept.items()}}
+
+
+def _grasp_job(job: tuple) -> dict:
+    src, seed, out, kw = job
+    try:
+        r = generate(Path(src), seed, Path(out), layout=False, **kw)
+        return {k: r.get(k) for k in ("src", "seed", "ok", "progress", "grasp_shift_mm", "arm_m", "cam_m")}
+    except Exception as e:  # noqa: BLE001 - one bad source shouldn't stop the set
+        return {"src": Path(src).name, "seed": seed, "ok": False, "error": repr(e)}
+
+
+def generate_grasps(src_dir: Path, out: Path, seeds: int = 6, seed_base: int = GRASP_SEED_BASE, jobs: int = 6,
+                    **kw) -> int:
+    """Off-centre grasps: each source take (minus those excluded with `qc audit --exclude`) replayed in its own
+    layout with the bricks shifted between the finger pads (`generate` grasp options in kw), `seeds` tries each.
+    Every take is simulated and kept only if it passes `check`. Prints one JSON line per try; returns kept."""
+    Path(out).mkdir(parents=True, exist_ok=True)
+    excluded = {f for f, c in load_curation(Path(src_dir)).items() if c.get("exclude")}
+    srcs = [s for s in sorted(Path(src_dir).glob("episode_*.hdf5")) if s.name not in excluded]
+    print(f"{len(srcs)} sources ({len(excluded)} excluded by hand: {sorted(excluded)})", flush=True)
+    jobs_ = [(str(s), seed_base + 100 * n + k, str(out), kw) for n, s in enumerate(srcs) for k in range(seeds)]
+    ok = 0
+    with ProcessPoolExecutor(jobs) as ex:
+        for r in ex.map(_grasp_job, jobs_):
+            ok += bool(r.get("ok"))
+            print(json.dumps(r), flush=True)
+    print(f"{ok}/{len(jobs_)} takes kept -> {out}")
+    return ok

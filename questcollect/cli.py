@@ -257,6 +257,114 @@ def retime(
         typer.secho(f"\n{1 - total_after / total_before:.0%} shorter overall -> {out}", fg="green")
 
 
+generate_app = typer.Typer(no_args_is_help=True, help="Experimental: new takes re-simulated from recorded ones "
+                                                         "(questcollect/generate.py); sources are never changed")
+app.add_typer(generate_app, name="generate")
+
+
+def _layout_kw(spawn_jitter, spawn_yaw, tower_yaw, tower_frac, base_xy, arm_xy, arm_yaw) -> dict:
+    import numpy as np
+
+    return dict(jitter=spawn_jitter, spawn_yaw=np.deg2rad(spawn_yaw), tower_yaw=np.deg2rad(tower_yaw),
+                tower_frac=tower_frac, base_xy=base_xy, arm_xy=arm_xy, arm_yaw=np.deg2rad(arm_yaw))
+
+
+_JITTER = "m, +- around each SPAWN centre"
+_SPAWN_YAW = "deg, +- brick start yaw"
+_TOWER_YAW = "deg, +- turn of the whole tower"
+_TOWER_FRAC = "share of takes with a turned tower"
+_BASE_XY = "m, +- shift of the base in the build area"
+_ARM_XY = "m, +- start TCP offset per arm (z: half)"
+_ARM_YAW = "deg, +- start TCP yaw offset per arm"
+
+
+@generate_app.command("take")
+def generate_take(
+    src: Path = typer.Argument(..., help="Source episode"),
+    seeds: list[int] = typer.Argument(..., help="One take per seed"),
+    out: Optional[Path] = typer.Option(None, help="Folder for gen_<src>_s<seed>.hdf5 (default: nothing written)"),
+    identity: bool = typer.Option(False, help="Replay the source unchanged (checks the replay)"),
+    keep_failed: bool = typer.Option(False, help="Also write takes that fail the check"),
+    spawn_jitter: Optional[float] = typer.Option(None, help=_JITTER + " (default: sim.SPAWN_JITTER_M)"),
+    spawn_yaw: Optional[float] = typer.Option(None, help=_SPAWN_YAW + " (default: sim.SPAWN_YAW)"),
+    tower_yaw: float = typer.Option(0.0, help=_TOWER_YAW),
+    tower_frac: float = typer.Option(1.0, help=_TOWER_FRAC),
+    base_xy: float = typer.Option(0.0, help=_BASE_XY),
+    arm_xy: float = typer.Option(0.0, help=_ARM_XY),
+    arm_yaw: float = typer.Option(0.0, help=_ARM_YAW),
+):
+    """Takes from one source in new layouts; prints one JSON line per seed (`ok`: passed the check)."""
+    _headless_gl()
+    import json
+
+    import numpy as np
+
+    from questcollect.generate import generate
+    from questcollect.sim import SPAWN_JITTER_M, SPAWN_YAW
+
+    kw = _layout_kw(SPAWN_JITTER_M if spawn_jitter is None else spawn_jitter,
+                    float(np.rad2deg(SPAWN_YAW)) if spawn_yaw is None else spawn_yaw,
+                    tower_yaw, tower_frac, base_xy, arm_xy, arm_yaw)
+    for seed in seeds:
+        print(json.dumps(generate(src, seed, out, identity, keep_failed=keep_failed, **kw)), flush=True)
+
+
+@generate_app.command("set")
+def generate_set(
+    out: Path = typer.Argument(..., help="Folder for episode_XXXXXX.hdf5 + names.txt"),
+    src: Path = typer.Option(Path("data/episodes"), help="Folder of source takes"),
+    per: int = typer.Option(10, help="Kept takes per source"),
+    max_tries: int = typer.Option(30, help="Seeds tried per source at most"),
+    seed_base: Optional[int] = typer.Option(None, help="Another value gives other layouts (top-ups); "
+                                                       "default generate.SET_SEED_BASE"),
+    jobs: int = typer.Option(6, help="Parallel sims (~0.8 GB each; 14 GB RAM: <= 6)"),
+    spawn_jitter: float = typer.Option(0.06, help=_JITTER),
+    spawn_yaw: float = typer.Option(25.0, help=_SPAWN_YAW),
+    tower_yaw: float = typer.Option(20.0, help=_TOWER_YAW),
+    tower_frac: float = typer.Option(0.5, help=_TOWER_FRAC),
+    base_xy: float = typer.Option(0.01, help=_BASE_XY),
+    arm_xy: float = typer.Option(0.05, help=_ARM_XY),
+    arm_yaw: float = typer.Option(15.0, help=_ARM_YAW),
+):
+    """A balanced set: `per` kept takes in new layouts from each source take."""
+    _headless_gl()
+    import json
+
+    from questcollect.generate import SET_SEED_BASE
+    from questcollect.generate import generate_set as run
+
+    kw = _layout_kw(spawn_jitter, spawn_yaw, tower_yaw, tower_frac, base_xy, arm_xy, arm_yaw)
+    seed_base = SET_SEED_BASE if seed_base is None else seed_base
+    summary = run(src, out, per=per, max_tries=max_tries, jobs=jobs, seed_base=seed_base, **kw)
+    options = dict(out=str(out), src=str(src), per=per, max_tries=max_tries, seed_base=seed_base, jobs=jobs,
+                   spawn_jitter=spawn_jitter, spawn_yaw=spawn_yaw, tower_yaw=tower_yaw, tower_frac=tower_frac,
+                   base_xy=base_xy, arm_xy=arm_xy, arm_yaw=arm_yaw)
+    print(json.dumps({**summary, "options": options}))
+
+
+@generate_app.command("grasps")
+def generate_grasps(
+    src: Path = typer.Argument(..., help="Folder of source takes (those excluded with `qc audit --exclude` skipped)"),
+    out: Path = typer.Option(..., help="Folder for the kept takes"),
+    seeds: int = typer.Option(6, help="Takes tried per source"),
+    seed_base: Optional[int] = typer.Option(None, help="Default generate.GRASP_SEED_BASE"),
+    offset: float = typer.Option(0.02, help="m, max off-centre shift along the brick"),
+    across: float = typer.Option(0.002, help="m, +- shift across (the fingers re-centre it)"),
+    bricks: list[int] = typer.Option([0, 1], help="Brick indices (0 red, 1 blue, ...); repeat the option"),
+    min_cam: float = typer.Option(0.025, help="m, closest wrist cameras accepted"),
+    jobs: int = typer.Option(6, help="Parallel sims (~1.2 GB each; 14 GB RAM: <= 6)"),
+):
+    """The source layouts and timing, with off-centre grasps: each brick starts shifted between the finger pads
+    while the hand reaches where the source hand did; the place follows the brick. Teaches a policy that grasps
+    1-2 cm off to align the brick, not the hand."""
+    _headless_gl()
+    from questcollect.generate import GRASP_SEED_BASE
+    from questcollect.generate import generate_grasps as run
+
+    run(src, out, seeds=seeds, jobs=jobs, seed_base=GRASP_SEED_BASE if seed_base is None else seed_base,
+        grasp_offset=offset, grasp_across=across, grasp_bricks=tuple(bricks), min_cam_m=min_cam)
+
+
 @app.command()
 def export(
     name: str = typer.Argument(..., help="Dataset name: written to <learn.datasets_dir>/<name>"),

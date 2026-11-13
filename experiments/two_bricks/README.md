@@ -47,7 +47,7 @@ state or how to fix it.
 ### Fine-tune on grasp-offset demos (`20261107-1744_dp_ft_mix_v5`)
 
 From the 60k checkpoint, 30k steps (`dp_ft`) on `mix_v5`: the 50 retimed takes + 116 generated ones whose bricks
-start shifted between the finger pads (`scripts/generate_grasps.py`; 166 episodes, 46 min). `check_pipeline` 16/17
+start shifted between the finger pads (`scripts/generate_grasps.py`, now `qc generate grasps`; 166 episodes, 46 min). `check_pipeline` 16/17
 (only the known 5 mrad start-pose outlier).
 
 | Eval | base in area | level 1 |

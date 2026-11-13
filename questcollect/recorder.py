@@ -233,7 +233,7 @@ def list_episodes(out_dir: Path) -> list[dict]:
             "duration_s": m.get("duration_s"), "num_steps": m.get("num_steps"),
             "input_mode": m.get("input_mode"), "operator": m.get("operator"), "created_at": m.get("created_at"),
             "source": m.get("source", "teleop"),
-            # Derived episodes (scripts/generate_demos.py, qc retime): which file they came from and how.
+            # Derived episodes (qc generate, qc retime): which file they came from and how.
             "origin": m.get("retimed_from") or m.get("generated_from"),
             "generation": _json_attr(m.get("generation")),
             "retime_moves": len(_json_attr(m["retime_moves"])) if "retime_moves" in m else None,

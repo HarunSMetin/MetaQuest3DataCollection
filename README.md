@@ -177,8 +177,8 @@ Everything goes through the `qc` command (run it as `uv run qc …`; every comma
 | `qc replay <file>` | play an episode back in MuJoCo's viewer |
 | `qc audit` | quality report of every episode, and which ones training will use |
 | `qc retime` | experimental: overlap the arms' work in recorded takes (re-simulated, originals kept) |
-| `scripts/generate_set.py <out>` | experimental: new takes from the recorded ones in new brick layouts (re-simulated, checked) |
-| `scripts/generate_grasps.py <src> --out <dir>` | experimental: the same takes with off-centre grasps (re-simulated, checked) |
+| `qc generate set <out>` | experimental: new takes from the recorded ones in new brick layouts (re-simulated, checked) |
+| `qc generate grasps <src> --out <dir>` | experimental: the same takes with off-centre grasps (re-simulated, checked) |
 | `qc export <name>` | turn the selected episodes into a LeRobot dataset |
 | `qc train <dataset>` | train a policy on a dataset (lerobot-train) |
 | `qc eval <run>` | test a trained policy in the simulator |
@@ -402,23 +402,24 @@ uv run qc retime                                   # all episodes -> data/episod
 uv run qc audit --raw data/episodes_retimed && uv run qc export v1r --raw data/episodes_retimed
 ```
 
-**Optional, experimental: generate.** `scripts/generate_set.py` makes new takes from yours: bricks start
+**Optional, experimental: generate.** `qc generate set` makes new takes from yours: bricks start
 elsewhere (options widen the spawn area, turn the tower, shift the base, start the arms elsewhere), your hand
 motions follow the bricks, and every take is re-simulated and kept only if it passes the same checks. Run
 `qc retime` on the result to overlap the arms there too.
 
 ```bash
-uv run python scripts/generate_set.py data/episodes_generated --per 10   # 10 kept takes per recorded one
+uv run qc generate set data/episodes_generated --per 10   # 10 kept takes per recorded one
+uv run qc generate take data/episodes/episode_000000.hdf5 1 2 3   # try single layouts (JSON per seed; --out to keep)
 uv run qc retime data/episodes_generated/episode_*.hdf5 --out data/episodes_generated_retimed
 ```
 
-`scripts/generate_grasps.py` keeps your layout and timing but makes the grasps off centre: each brick starts
+`qc generate grasps` keeps your layout and timing but makes the grasps off centre: each brick starts
 shifted along the axis between the finger pads (40-100 % of up to `--offset` 2 cm, capped so the pads stay on
 it) while the hand reaches where yours did, and the place follows the brick in the hand. It shows a policy how to
 place a brick it grasped 1-2 cm off. Sources excluded with `qc audit --exclude` are skipped.
 
 ```bash
-uv run python scripts/generate_grasps.py data/episodes_retimed_v4 --out data/episodes_grasp_v4 --seeds 8 --jobs 6
+uv run qc generate grasps data/episodes_retimed_v4 --out data/episodes_grasp_v4 --seeds 8 --jobs 6
 ```
 
 **2. Export a dataset.** Renders the cameras from the recorded states, in the scene each episode was recorded in:
