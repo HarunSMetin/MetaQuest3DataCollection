@@ -63,7 +63,15 @@ success.
 
 ## Results
 
-| Run | Eval | Success | base in area | level 1 | level 2 | level 3 |
-|---|---|---|---|---|---|---|
-| | 16 steps per chunk | | | | | |
-| | 8 steps per chunk | | | | | |
+| Run | Eval | Success | base in area | level 1 |
+|---|---|---|---|---|
+| `20261102-0505_dp_240_tower_v2` | 16 steps per chunk | 0/50 | 48% | 4% |
+
+The blue brick is never lifted in 29/50 rollouts (ACT: 10). Later diffusion runs are in the log in
+[../README.md](../README.md) and in [../REPORT_2026-11-12.md](../REPORT_2026-11-12.md).
+
+Two assumptions in the settings table above did not hold up (2026-11-12, [../REVIEW_2026-11-12.md](../REVIEW_2026-11-12.md)):
+- "`joint_vel` is already in the state" was the reason for `n_obs_steps` 1. The joint velocity in the state is what
+  makes the closed loop unstable ([../obs_ablation/](../obs_ablation/README.md)).
+- Re-planning more often did not correct the last millimetres. In every run that was evaluated both ways, 8 steps
+  per chunk scored below 16.

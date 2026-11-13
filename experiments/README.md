@@ -16,8 +16,10 @@ a preset in `config.yaml` (`learn.presets`) plus a note here. Run one with
 | 2026-11-07 | `20261106-2147_dp_240_pre_two_bricks_v4` | two_bricks_v4: 50 retimed (staged) takes, until level 1 | Diffusion `dp_240_pre` (ImageNet ResNet18), cam_low + wrists | level 1 16% | [two_bricks/](two_bricks/README.md) |
 | 2026-11-07 | `20261107-1744_dp_ft_mix_v5` | mix_v5: two_bricks_v4 + 116 grasp-offset generated takes | fine-tune of the 60k checkpoint, 30k steps | level 1 14% (no gain; grasps worse) | [two_bricks/](two_bricks/README.md) |
 | 2026-11-12 | `20261111-1316_dp_240_pre_expert_v2` | expert_v2: 200 scripted-expert takes, until level 1 | Diffusion `dp_240_pre` | level 1 2% | fit 1.4 mm open loop, lands 2–7 cm short closed loop ([expert_dagger/](expert_dagger/README.md)) |
+| 2026-11-13 | `review_oracle2_vel`, `review_oracle2_novel` | expert_v2 without cameras, brick poses | Diffusion `dp_state1`, with / without joint velocity, 20k steps | level 1 0% / 0% | blue within 10 mm of its goal in 2/50 / 16/50; velocity in the state destabilizes the loop ([obs_ablation/](obs_ablation/README.md)) |
 
-Full report of all experiments so far: [REPORT_2026-11-12.md](REPORT_2026-11-12.md).
+Full report of all experiments so far: [REPORT_2026-11-12.md](REPORT_2026-11-12.md). Review of it, with the
+reasons for the closed-loop failures and a ranked plan: [REVIEW_2026-11-12.md](REVIEW_2026-11-12.md).
 
 ### ACT on tower_v2
 

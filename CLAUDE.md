@@ -29,6 +29,7 @@ uv run qc eval outputs/<run> [--n 50] [--ensemble 0.01]   # -> outputs/<run>/eva
 uv run qc serve --policy outputs/<run> [--control shared|policy]
 MUJOCO_GL=egl uv run --extra learn python scripts/check_pipeline.py [--config <cfg>] [--dataset <name>]  # before training: data == eval world
 MUJOCO_GL=egl uv run --extra learn python scripts/fit_error.py <run|checkpoint> <episodes dir>  # open-loop mm error on demo frames
+MUJOCO_GL=egl uv run --extra learn python scripts/drift_test.py <run|checkpoint> <episodes dir>  # closed-loop mm drift from demo states, per chunk length and with single inputs teacher-forced
 
 uv run --group dev pytest                                   # all tests
 uv run --group dev pytest tests/test_teleop.py::test_protocol_roundtrip   # single test
