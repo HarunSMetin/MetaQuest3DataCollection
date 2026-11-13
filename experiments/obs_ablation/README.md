@@ -56,12 +56,14 @@ experiments/obs_ablation/night_run.sh                 # log: outputs/review_nigh
 # resume:  QC_CONFIG=experiments/obs_ablation/config_cam_novel.yaml scripts/train_and_eval.sh --resume outputs/<run>
 ```
 
-Compare with the run with velocity, `outputs/20261111-1316_dp_240_pre_expert_v2`, at the same checkpoint.
+Compare with the run with velocity, `outputs/20261111-1316_dp_240_pre_expert_v2`, at the same checkpoint. Its
+030000 (`eval/20261113-080252`): base in area 22%, level 1 0%, blue within 30 mm of red 1/50, within 10 mm 0/50,
+median closest approach 233 mm (`diagnostics/e9_approach.py <eval folder>`).
 
 ## Diagnostics
 
 One-off scripts in `diagnostics/` (run from the repo root with `MUJOCO_GL=egl uv run --extra learn python ...`):
 `e2_restart` closed loop from demo states, `e3_drift` drift with and without the safety filter, `e4_channels`
 single channels forced, `e5_shortcut` the 0.12 s regression, `e6_baselines` trivial open-loop predictors,
-`e7_transit` transit speed and shortfall in rollouts, `e8_eval_pinned` evaluation of the oracles. The general ones
+`e7_transit` transit speed and shortfall in rollouts, `e8_eval_pinned` evaluation of the oracles, `e9_approach` how close the carried brick gets. The general ones
 became `scripts/drift_test.py` and the baselines in `scripts/fit_error.py`.
