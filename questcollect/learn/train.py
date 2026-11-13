@@ -53,6 +53,44 @@ def run_manifest(path: Path) -> dict:
     return json.loads((run_dir(path) / RUN_MANIFEST).read_text())
 
 
+def list_runs(runs_dir: Path) -> list[dict]:
+    """Every `qc train` run in a folder, newest first, for the dashboard's Policy tab: its checkpoints (those with a
+    pretrained_model, oldest first, `last` = which step it points to), what it was trained on, and its evaluations
+    (newest first, from eval/*/metrics.json). Reads only small JSON files: no torch."""
+    out = []
+    for run in Path(runs_dir).glob(f"*/{RUN_MANIFEST}"):
+        run = run.parent
+        try:
+            man = json.loads((run / RUN_MANIFEST).read_text())
+        except (OSError, ValueError):
+            continue
+        ck = run / "train" / "checkpoints"
+        steps = sorted(d.name for d in ck.iterdir() if d.name != "last" and (d / "pretrained_model").is_dir()) \
+            if ck.is_dir() else []
+        last = (ck / "last").resolve().name if (ck / "last" / "pretrained_model").is_dir() else None
+        kind = None
+        if steps:
+            try:
+                kind = json.loads((ck / steps[-1] / "pretrained_model" / "config.json").read_text()).get("type")
+            except (OSError, ValueError):
+                pass
+        evals = []
+        for m in sorted(run.glob("eval/*/metrics.json"), reverse=True):
+            try:
+                e = json.loads(m.read_text())
+            except (OSError, ValueError):
+                continue
+            s = e.get("summary", {})
+            evals.append({"time": m.parent.name, "checkpoint": Path(e.get("checkpoint", "")).parent.name or None,
+                          "n": s.get("rollouts"), "success_rate": s.get("success_rate"),
+                          "stage_rates": s.get("stage_rates", {}), "n_action_steps": e.get("settings", {}).get("n_action_steps")})
+        feats = man.get("dataset_manifest", {}).get("features", {})
+        out.append({"name": run.name, "path": str(run), "created_at": man.get("created_at"),
+                    "preset": man.get("preset"), "dataset": man.get("dataset"), "type": kind,
+                    "features": feats, "steps": steps, "last": last, "evals": evals})
+    return sorted(out, key=lambda r: r["created_at"] or "", reverse=True)
+
+
 def constant_inputs(data_root: Path) -> dict[str, list[int]]:
     """Per non-image policy feature, the indices whose range over the whole dataset is (almost) zero.
 

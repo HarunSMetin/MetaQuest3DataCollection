@@ -1,18 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "../net";
 import { drawGoal, levelStates } from "../goal";
-import { type AuditRows, type DatasetRow, type EpisodeEdit, type EpisodeRow, fetchTask, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
+import { type AuditRows, type DatasetRow, type EpisodeEdit, type EpisodeRow, fetchTask, type PolicyRun, type ServerEvent, SRC_CONTROLLER, SRC_HAND, type Status, type TaskSpec } from "../protocol";
 import { EpisodeBrowser, epNumber, REPLAY_SPEEDS, ReplayBar } from "./Episodes";
+import { PolicyControl, PolicyRuns } from "./Policy";
 import { type Cmd, fmt } from "./util";
 import { Viewer3D, type ViewerHandle } from "./Viewer3D";
 
 type Toast = { id: number; text: string; kind: string };
-type Tab = "record" | "episodes";
+type Tab = "record" | "episodes" | "policy";
 const TAB_KEY = "qc.dash.tab";
 const DATASET_KEY = "qc.dash.dataset";
 
 function savedTab(): Tab {
-  try { return localStorage.getItem(TAB_KEY) === "episodes" ? "episodes" : "record"; } catch { return "record"; }
+  try {
+    const t = localStorage.getItem(TAB_KEY);
+    return t === "episodes" || t === "policy" ? t : "record";
+  } catch { return "record"; }
 }
 
 export function App() {
@@ -26,6 +30,7 @@ export function App() {
   const [selFile, setSelFile] = useState<string | null>(null);
   const [datasets, setDatasets] = useState<DatasetRow[]>([]);
   const [dataset, setDataset] = useState<string>(() => { try { return localStorage.getItem(DATASET_KEY) ?? ""; } catch { return ""; } });
+  const [runs, setRuns] = useState<PolicyRun[] | null>(null);
   const viewer = useRef<ViewerHandle | null>(null);
   const link = useRef<Link | null>(null);
   const statusRef = useRef<Status | null>(null);
@@ -67,6 +72,10 @@ export function App() {
     return () => l.close();
   }, [refreshEpisodes, toast]);
   useEffect(refreshEpisodes, [refreshEpisodes]);
+  const refreshRuns = useCallback(() => {
+    fetch("/api/policies").then((r) => r.json()).then(setRuns).catch(() => setRuns([]));
+  }, []);
+  useEffect(() => { if (tab === "policy") refreshRuns(); }, [tab, refreshRuns]);
 
   const cmd: Cmd = useCallback((name, args = {}) => link.current?.command(name, args), []);
 
@@ -81,7 +90,7 @@ export function App() {
 
   // Episodes tab: the selected episode is loaded as a paused replay; leaving the tab goes back to the live scene.
   useEffect(() => {
-    if (tab === "record" && statusRef.current?.replay) cmd("replay_stop");
+    if (tab !== "episodes" && statusRef.current?.replay) cmd("replay_stop");
   }, [tab, cmd]);
   useEffect(() => {
     if (tab === "episodes" && !selected && rows.length) setSelFile(rows[0].file);
@@ -118,6 +127,7 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName;
       if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (tab === "policy") return;
       if (tab === "record") {
         if (e.code === "Space") { e.preventDefault(); cmd("record_toggle"); }
         else if (e.key === "s") cmd("save", { success: true });
@@ -163,7 +173,7 @@ export function App() {
           <div className="card viewer-card">
             <Viewer3D handle={viewer} />
             <div className="legend"><i className="dot l" /> left <i className="dot r" /> right</div>
-            {tab === "record" && <Warnings status={status} />}
+            {tab !== "episodes" && <Warnings status={status} />}
             <StateOverlay status={status} />
           </div>
           {tab === "episodes" && <ReplayBar status={status} ep={selected} audit={audit} task={task} cmd={cmd} />}
@@ -175,6 +185,13 @@ export function App() {
               <RecorderCard status={status} online={online} cmd={cmd} />
               <GoalCard task={task} status={status} />
               <TeleopCard status={status} cmd={cmd} />
+            </>
+          ) : tab === "policy" ? (
+            <>
+              <PolicyControl status={status} cmd={cmd} />
+              <PolicyRuns runs={runs} status={status} cmd={cmd} refresh={refreshRuns} />
+              <RecorderCard status={status} online={online} cmd={cmd} />
+              <GoalCard task={task} status={status} />
             </>
           ) : (
             <EpisodeBrowser episodes={episodes} audit={audit} selected={selected} onSelect={(e) => setSelFile(e.file)}
@@ -203,6 +220,9 @@ function TopBar({ status, online, tab, setTab, count }: {
         </button>
         <button className={tab === "episodes" ? "active" : ""} onClick={() => setTab("episodes")}>
           Episodes <small>{count}</small>
+        </button>
+        <button className={tab === "policy" ? "active" : ""} onClick={() => setTab("policy")}>
+          <i className={`rec-dot pol ${status?.control.driver === "policy" ? "on" : ""}`} /> Policy
         </button>
       </nav>
       <div className="chips">

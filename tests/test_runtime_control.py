@@ -268,3 +268,75 @@ def test_policy_rollouts_are_listed_read_only(rt, tmp_path):
     assert r.status_code == 403
     assert client.get("/api/episodes", params={"dataset": "eval/../x"}).status_code == 404
     assert sorted(p.name for p in ev.iterdir()) == before  # no audit cache, no curation.json
+
+
+def test_policy_tab_loads_in_the_background(rt, tmp_path, monkeypatch):
+    """Policy tab: load_policy loads off the sim thread and swaps on a tick; a failed load is reported; unload goes
+    back to teleop; reset can recreate an eval rollout's start layout; /api/policies lists runs without torch."""
+    import json
+    import sys
+    import types
+
+    from fastapi.testclient import TestClient
+
+    from questcollect.learn.evaluate import eval_seeds
+    from questcollect.server import create_app
+
+    class FakeRunner(StubPolicy):
+        def __init__(self, path, cfg, n_action_steps=None):
+            if "broken" in str(path):
+                raise FileNotFoundError("no checkpoint")
+            super().__init__(np.tile(HOME_Q, 2))
+            self.name, self.n, self.closed = path.name, n_action_steps, False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setitem(sys.modules, "questcollect.learn.policy", types.SimpleNamespace(PolicyRunner=FakeRunner))
+    rt.policy = None
+
+    def until(cond):
+        for _ in range(200):
+            _ticks(rt, 1)
+            if cond():
+                _ticks(rt, 5)  # the status dict is refreshed every 5th tick
+                return
+            time.sleep(0.01)
+        raise AssertionError("timed out")
+
+    rt.command("load_policy", path=str(tmp_path / "run_a"), n_action_steps=4)
+    until(lambda: rt.policy is not None)
+    first = rt.policy
+    assert first.name == "run_a" and first.n == 4 and rt.status()["control"]["loading"] is None
+    rt.command("set_control_mode", mode="policy")
+    _ticks(rt, 10)
+    assert rt._driver == "policy" and rt.status()["control"]["policy_s"] > 0
+    rt.command("load_policy", path=str(tmp_path / "run_b"), n_action_steps=None)
+    until(lambda: rt.policy is not first)
+    assert first.closed and rt.policy.n is None and rt.control_mode == "policy"
+    rt.command("load_policy", path=str(tmp_path / "broken"))
+    until(lambda: rt._policy_error is not None)
+    assert rt.policy.name == "run_b" and "no checkpoint" in rt.status()["control"]["error"]
+    rt.command("unload_policy")
+    _ticks(rt, 1)
+    assert rt.policy is None and rt.control_mode == "teleop"
+    rt.command("reset", eval_index=2)
+    _ticks(rt, 1)
+    assert rt.env.seed == eval_seeds(3)[2]
+
+    run = tmp_path / "outputs" / "20261113-0000_dp_x"
+    ck = run / "train" / "checkpoints"
+    for s in ("010000", "020000"):
+        (ck / s / "pretrained_model").mkdir(parents=True)
+    (ck / "020000" / "pretrained_model" / "config.json").write_text('{"type": "diffusion"}')
+    (ck / "last").symlink_to("020000")
+    (run / "questcollect_run.json").write_text(json.dumps({"created_at": "2026-11-13T00:00:00", "preset": "dp",
+                                                           "dataset": "d", "dataset_manifest": {"features": {}}}))
+    (run / "eval" / "20261113-010000").mkdir(parents=True)
+    (run / "eval" / "20261113-010000" / "metrics.json").write_text(json.dumps({
+        "checkpoint": str(ck / "020000" / "pretrained_model"), "settings": {},
+        "summary": {"rollouts": 5, "success_rate": 0.2, "stage_rates": {"level_1": 0.4}}}))
+    rt.cfg.learn.runs_dir = str(tmp_path / "outputs")
+    rows = TestClient(create_app(rt)).get("/api/policies").json()
+    assert rows[0]["steps"] == ["010000", "020000"] and rows[0]["last"] == "020000" and rows[0]["type"] == "diffusion"
+    assert rows[0]["evals"][0]["checkpoint"] == "020000" and rows[0]["evals"][0]["stage_rates"] == {"level_1": 0.4}

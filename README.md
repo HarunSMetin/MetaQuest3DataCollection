@@ -500,6 +500,17 @@ episode, and the next `qc export` uses only your corrections from these takes (`
 the most effective data you can add: it shows the policy how to recover from its own mistakes. The dashboard's
 Teleoperation card switches between *You drive*, *Shared* and *Policy*.
 
+**The dashboard's Policy tab** does the same without restarting the server (start it with
+`uv run --extra learn qc serve`, so torch is installed). It lists every run in `outputs/`
+with its dataset, inputs, checkpoints and latest evaluations. Pick a run, a checkpoint (`last` or any saved step)
+and a chunk length (steps executed per prediction; *as trained* = what `qc eval` uses), then press **Load**. It
+loads in the background in a few seconds while the simulation keeps running, and a second Load swaps the policy.
+**▶ Run** lets it drive, **🤝 Shared** lets it drive until you press Grip, **■ Stop** hands the arms back to you,
+and **⏏ Unload** frees the GPU. **New scene** starts a random layout. **Eval layout #i** starts the layout of `qc eval`
+rollout *i* (the same seed list), so a saved rollout can be compared with a live run. Record a run or your
+takeover with the recorder card on the same tab. While a training job is using the GPU, loading a second model
+there may not fit: pause the training first.
+
 **Collisions.** Three layers keep the arms off the table and away from each other:
 
 | Layer | What it does |
@@ -700,7 +711,7 @@ Runtime settings live in [config.yaml](config.yaml). Use another file with `uv r
 | `learn.datasets_dir`, `runs_dir` | `data/lerobot`, `outputs` | where datasets and training runs go |
 | `learn.presets` | `act_240`, `dp_240`, `dp_240_pre`, `dp_240_pre_ema` | named lerobot-train settings for `qc train --preset` |
 | `safety.enabled`, `arm_margin`, `table_margin`, `finger_table_margin` | true, 0.02, 0.01, 0.005 | the safety filter on every action, teleop and policy: distances it keeps between the arms, arm links and the table, fingertips and the table (m) |
-| `control.mode`, `policy`, `n_action_steps` | teleop, none, 10 | who drives in `qc serve`, and how often a live policy is asked |
+| `control.mode`, `policy`, `n_action_steps` | teleop, none, 10 | who drives in `qc serve`, and how often a live policy is asked (the Policy tab's default chunk) |
 
 **The task** is defined by constants at the top of [questcollect/sim.py](questcollect/sim.py): the bricks
 (`BRICKS`: size, colour, mass), the tower layout (`TOWER`), the taped square (`BUILD_AREA_CENTER`,

@@ -161,6 +161,9 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   `SafetyFilter.filter` (the operator path = IK → the same filter) (mink QP, 8 substeps: the linearized collision limits need them) → apply. While the policy
   drives, `ik.reset(q)` + `Teleop.sync_hold` keep the operator side at the current pose so a Grip takeover never
   jumps. `record.action_noise` = DART noise on executed (not recorded) operator targets.
+- **Policy tab** (dashboard): `GET /api/policies` (`learn.train.list_runs`, JSON only) + `load_policy` /
+  `unload_policy` commands; the runner is built in a background thread and swapped in by the sim thread
+  (`Runtime._swap_policy`), never blocking the 50 Hz loop.
 - **Config**: runtime tunables live in `config.yaml` (incl. `curate`, `learn` + presets, `safety`, `control`),
   loaded into pydantic models in `config.py`. Exceptions: the task
   definition (brick sizes/colors/masses, `TOWER`, tolerances, stud `PLAY`, clutch forces) is constants at the top of

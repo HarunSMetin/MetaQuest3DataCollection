@@ -146,13 +146,34 @@ export interface Status {
     rejected: string | null; // why training would skip it
     used_s: number; // seconds a dataset would use (contact moments and idle ends cut)
   } | null;
-  /** Who drives the arms (runtime.py CONTROL_MODES); `policy` is null unless `qc serve --policy` loaded one. */
+  /** Who drives the arms (runtime.py CONTROL_MODES); `policy` is null until one is loaded (`qc serve --policy` or
+   * the Policy tab's `load_policy` command). */
   control: {
     mode: "teleop" | "policy" | "shared";
     driver: "operator" | "policy";
-    policy: string | null;
+    policy: string | null;      // run name of the loaded policy
+    path?: string | null;       // what was loaded: a run folder or a checkpoint's pretrained_model folder
+    loading?: string | null;    // a load in progress (background thread)
+    error?: string | null;      // why the last load failed
+    n_action_steps?: number | null;  // steps executed from each predicted chunk
+    policy_s?: number;          // seconds the policy has driven since the scene was reset
     safety_rad: number; // how much the safety filter changed the policy's last joint targets
   };
+}
+
+/** GET /api/policies: trained runs in learn.runs_dir (learn/train.py list_runs), newest first. */
+export interface PolicyRun {
+  name: string;
+  path: string;
+  created_at: string | null;
+  preset: string | null;
+  dataset: string | null;
+  type: string | null; // "diffusion" | "act" | ...
+  features: { cameras?: string[]; action?: string; env_state?: boolean; joint_vel?: boolean; ee_wrench?: boolean };
+  steps: string[];      // saved checkpoints, oldest first
+  last: string | null;  // the step `last` points to
+  evals: { time: string; checkpoint: string | null; n: number | null; success_rate: number | null;
+           stage_rates: Record<string, number>; n_action_steps: number | null }[];
 }
 
 export type ServerEvent =

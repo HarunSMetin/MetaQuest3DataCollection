@@ -73,6 +73,14 @@ class Runtime:
         # Either way the safety filter keeps the arms off each other and the table.
         self.safety = SafetyFilter(cfg.sim, cfg.ik, cfg.safety, self.dt)
         self.policy = None  # learn.policy.PolicyRunner, see load_policy
+        self._policy_path: str | None = None
+        # Loading from the dashboard (Policy tab) runs in its own thread (torch import + weights: seconds) and hands
+        # the result over here; the sim thread swaps it in, so the 50 Hz loop never waits.
+        self._policy_lock = threading.Lock()
+        self._policy_loading: str | None = None
+        self._policy_ready: tuple | None = None   # (runner | None, path, error)
+        self._policy_error: str | None = None
+        self._policy_steps = 0  # control steps the policy drove since the scene was reset
         self.control_mode = "teleop"
         self._driver = "operator"
         self._safety_rad = 0.0
@@ -133,6 +141,63 @@ class Runtime:
         from questcollect.learn.policy import PolicyRunner
 
         self.policy = PolicyRunner(Path(run), self.cfg, n_action_steps=self.cfg.control.n_action_steps)
+        self._policy_path = str(run)
+
+    def _load_policy_async(self, path: str, n_action_steps: int | None) -> None:
+        """`load_policy` command: load in the background; `_swap_policy` puts it in place on a later tick."""
+        with self._policy_lock:
+            if self._policy_loading:
+                self._toast("A policy is still loading", "warn")
+                return
+            self._policy_loading = path
+        self._policy_error = None
+
+        def work():
+            try:
+                from questcollect.learn.policy import PolicyRunner
+
+                result = (PolicyRunner(Path(path), self.cfg, n_action_steps=n_action_steps), path, None)
+            except Exception as e:  # noqa: BLE001 - reported to the dashboard (no learn extra, bad checkpoint, OOM)
+                log.exception("loading policy %s failed", path)
+                result = (None, path, f"{type(e).__name__}: {e}")
+            with self._policy_lock:
+                self._policy_ready = result
+
+        threading.Thread(target=work, name="policy-load", daemon=True).start()
+
+    def _swap_policy(self) -> None:
+        with self._policy_lock:
+            ready, self._policy_ready = self._policy_ready, None
+            if ready is not None:
+                self._policy_loading = None
+        if ready is None:
+            return
+        runner, path, error = ready
+        if runner is None:
+            self._policy_error = error
+            self._toast(f"Couldn't load the policy: {error}", "warn")
+            return
+        self._drop_policy()
+        self.policy, self._policy_path = runner, path
+        self._driver = "operator"  # its first tick as driver starts a fresh chunk
+        self._toast(f"Policy {runner.name} loaded" + ("" if self.control_mode != "teleop" else ": press Run"), "success")
+
+    def _policy_chunk(self) -> int | None:
+        """Steps executed from each predicted chunk by the loaded policy."""
+        lerobot = getattr(self.policy, "policy", None)
+        return getattr(getattr(lerobot, "config", None), "n_action_steps", None)
+
+    def _drop_policy(self) -> None:
+        old, self.policy, self._policy_path = self.policy, None, None
+        if old is not None:
+            old.close()  # its camera renderer belongs to this (the sim) thread
+            del old
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- public, thread-safe ---------------------------------------------------------------------
     def start(self) -> None:
@@ -220,6 +285,7 @@ class Runtime:
         self.teleop.reset({a: self._ik_pose(a) for a in ARMS})
         self.safety.reset(obs["joint_pos"])
         self._driver = "operator"  # a policy starts a fresh chunk on its first tick
+        self._policy_steps = 0
         self._branch = None
         self._grip_latch = [None] * len(ARMS)
         self._dart[:], self._dart_ou[:] = 0.0, 0.0
@@ -300,7 +366,13 @@ class Runtime:
         elif name == "reset":
             rec.discard()
             self._replay = None
-            self._reset_scene(kw.get("seed"))
+            seed = kw.get("seed")
+            if kw.get("eval_index") is not None:  # the start layout of `qc eval` rollout #i (needs the learn extra)
+                from questcollect.learn.evaluate import eval_seeds
+
+                i = max(0, int(kw["eval_index"]))
+                seed = eval_seeds(i + 1)[i]
+            self._reset_scene(seed)
         elif name == "set_mode":
             self.teleop.set_mode(kw.get("mode", "controllers"))
         elif name == "set_scale":
@@ -342,6 +414,13 @@ class Runtime:
         elif name == "replay_stop":
             self._replay = None
             self._reset_scene()
+        elif name == "load_policy":
+            n = kw.get("n_action_steps", self.cfg.control.n_action_steps)
+            self._load_policy_async(str(kw["path"]), None if n is None else int(n))
+        elif name == "unload_policy":
+            self.control_mode = "teleop"
+            self.teleop.release_all()
+            self._drop_policy()
         elif name == "set_control_mode":
             mode = kw.get("mode", "teleop")
             if mode != "teleop" and self.policy is None:
@@ -400,6 +479,7 @@ class Runtime:
         self._process_commands(now)
         self._tick_count += 1
         env = self.env
+        self._swap_policy()
         if self._hold_branch(now):
             return
 
@@ -481,6 +561,7 @@ class Runtime:
             self.ik.reset(q_target)
             self.teleop.sync_hold({a: self._ik_pose(a) for a in ARMS})
         self._driver = driver
+        self._policy_steps += driver == "policy"
         teleop = teleop_fields(frame, [out.engaged[a] for a in ARMS], [out.tracked[a] for a in ARMS],
                                self._rtt_ms) if recording else None
         source = SOURCE_POLICY if driver == "policy" else SOURCE_OPERATOR
@@ -656,6 +737,9 @@ class Runtime:
             "placement": self.placement.column_major(),
             "control": {"mode": self.control_mode, "driver": self._driver,
                         "policy": None if self.policy is None else self.policy.name,
+                        "path": self._policy_path, "loading": self._policy_loading, "error": self._policy_error,
+                        "n_action_steps": self._policy_chunk(),
+                        "policy_s": round(self._policy_steps * self.dt, 1),
                         "safety_rad": round(self._safety_rad, 3)},
             "review": self._review_summary(),
             "branch": None if self._branch is None else {"of": self._branch["of"], "step": self._branch["step"],

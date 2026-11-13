@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from questcollect.audit import (CURATION_FIELDS, audit_dir, forget_curation, kept_spans, labelled_success,
                                load_curation, update_curation, verdict)
 from questcollect.config import ROOT
+from questcollect.learn.train import list_runs
 from questcollect.protocol import parse_input
 from questcollect.recorder import episode_files, list_episodes
 from questcollect.runtime import Runtime
@@ -198,6 +199,11 @@ def create_app(runtime: Runtime) -> FastAPI:
                            "success": labelled_success(a, curation),
                            "verdict": why(a)} for name, a in audits.items()}
         return await asyncio.to_thread(run)
+
+    @app.get("/api/policies")
+    async def policies():
+        """Trained runs in learn.runs_dir for the Policy tab: checkpoints, inputs, evaluations (no torch needed)."""
+        return await asyncio.to_thread(list_runs, runtime.cfg.runs_dir)
 
     @app.post("/api/command")
     async def command(body: dict):

@@ -102,6 +102,7 @@ Rule: the server never touches simulation state directly. Anything that changes 
 | `GET /api/episodes` | → browser | saved episodes with their manual labels from `curation.json` (`success` = label, `recorded_success` = as saved, `tags`, `note`, `excluded`) and provenance (`origin` = `retimed_from`/`generated_from`, `generation`, `retime_moves`; `branch_of`/`branch_step` for a take-over). `?dataset=<folder>` (also on PATCH and audit) picks a sibling folder of `record.out_dir` or `eval/<run>/<time>` |
 | `PATCH /api/episodes/<file>`, `DELETE /api/episodes/<file>` | → server | change labels (`exclude`, `note`, `tags`, `success`; null = as recorded) via `audit.update_curation` in that folder's `curation.json` / delete the file and its labels (recording folder only: 403 for any other dataset; PATCH: 403 for rollouts, nothing is written into `outputs/`) |
 | `GET /api/audit` | → browser | per-episode audit: contact shares and events, idle share, level times, and why a dataset would skip it (same reasons as `audit.select`); for rollouts without writing the `audit.json` cache (`audit_dir(cache=False)`) |
+| `GET /api/policies` | → browser | trained runs in `learn.runs_dir` for the Policy tab (`learn.train.list_runs`): checkpoints, `last`, policy type, dataset features, evaluations from `eval/*/metrics.json` |
 | `POST /api/command` | → server | `{"name": ..., "args": {...}}`, queued to the sim thread |
 | `GET /api/preview/<cam>.jpg` | → browser | latest camera preview (rendered only while requested) |
 | `WS /ws/xr` | both | headset: binary input frames in; binary pose frames (every tick), JSON status + events out |
@@ -239,7 +240,15 @@ data/episodes/*.hdf5 ──qc audit──▶ audit.json (+ curation.json) ──
 
 **The dependency rule:** nothing outside [questcollect/learn/](../questcollect/learn/) imports torch or lerobot
 (optional extra `learn`), so recording works without them. The runtime imports `learn.policy` only inside
-`Runtime.load_policy`.
+`Runtime.load_policy` and the Policy tab's loader thread (`_load_policy_async`); `learn.train.list_runs`
+(`GET /api/policies`) reads only JSON files.
+
+**Policy tab.** `load_policy {path, n_action_steps}` builds the `PolicyRunner` in a `policy-load` thread (torch import
+and weights take seconds); the result is handed over under `_policy_lock` and `_swap_policy` (step 1 of the next
+tick) puts it in place and closes the previous runner in the sim thread (its camera renderer's GL context lives
+there), then `torch.cuda.empty_cache()`. A failed load sets `status.control.error`. `unload_policy` = teleop + drop.
+`status.control` adds `path`, `loading`, `error`, `n_action_steps` and `policy_s` (seconds driven since the scene
+reset). `reset {eval_index: i}` uses `learn.evaluate.eval_seeds`, the start layout of `qc eval` rollout *i*.
 
 | Stage | Code | What it does |
 | --- | --- | --- |
@@ -324,7 +333,7 @@ change shows up as a `scene_hash` mismatch warning.
 
 | Command | Covers |
 | --- | --- |
-| `uv run --group dev pytest` | frames, filters, clutch, mappers, protocol round-trip; scene build, brick physics, clicking, grasping, gripper speed, IK, state replay, scene export, recorder, haptics; audit and selection; safety filter; control modes and takeover; take over from a replayed frame; rollouts listed read-only |
+| `uv run --group dev pytest` | frames, filters, clutch, mappers, protocol round-trip; scene build, brick physics, clicking, grasping, gripper speed, IK, state replay, scene export, recorder, haptics; audit and selection; safety filter; control modes and takeover; take over from a replayed frame; rollouts listed read-only; Policy tab loading in the background |
 | `MUJOCO_GL=egl uv run --extra learn --group dev pytest` | the above plus `test_learn.py`: tiny episodes → export → a 2-step `lerobot-train` → a short `qc eval` rollout |
 | `cd web && npm run typecheck` | TypeScript |
 | `cd web/e2e && npm test` | an emulated Quest 3 against a running server: controllers, hands, clutch, gripper, record → save (setup at the top of `emulated-quest.mjs`) |
