@@ -21,8 +21,8 @@ from questcollect.config import Config
 from questcollect.frames import mat_to_quat_wxyz, quat_wxyz_to_mat
 from questcollect.ik import BimanualIK
 from questcollect.protocol import FLAG_ENGAGED_L, FLAG_ENGAGED_R, FLAG_RECORDING, InputFrame, pack_pose_frame
-from questcollect.recorder import (SOURCE_OPERATOR, SOURCE_POLICY, Recorder, RecState, make_step,
-                                   read_episode, teleop_fields)
+from questcollect.recorder import (SOURCE_OPERATOR, SOURCE_POLICY, Recorder, RecState, control_step,
+                                   read_episode, snapshot, teleop_fields)
 from questcollect.safety import SafetyFilter
 from questcollect.scene_export import body_poses, export_scene
 from questcollect.sim import ARMS, BRICKS, INSTRUCTION, LEVELS, TASK, BimanualEnv, CameraRenderer, task_spec
@@ -390,10 +390,7 @@ class Runtime:
             self._toast("Recording", "rec")
 
         recording = self.recorder.recording
-        if recording:
-            obs = env.observe()
-            state = env.get_state()
-            contacts = env.contact_flags()
+        before = snapshot(env) if recording else None
         # DART: execute a slightly perturbed target but record the operator's clean one, so the data shows how the
         # operator recovers from small errors (Laskey et al., 2017). The offset is a slow random drift: an
         # Ornstein-Uhlenbeck process (correlation DART_TAU_S) smoothed once more (DART_SMOOTH_S), because a raw OU
@@ -413,19 +410,13 @@ class Runtime:
             self.ik.reset(q_target)
             self.teleop.sync_hold({a: self._ik_pose(a) for a in ARMS})
         self._driver = driver
-        env.apply_action(q_exec, grippers)
-        success = env.success()
-
-        if recording:
-            teleop = teleop_fields(frame, [out.engaged[a] for a in ARMS], [out.tracked[a] for a in ARMS],
-                                   self._rtt_ms)
-            source = SOURCE_POLICY if driver == "policy" else SOURCE_OPERATOR
-            step = make_step(env, obs, state, q_target, grippers, ee, success, self._progress, contacts, teleop,
-                             source)
-            if self.recorder.append(now, step, success):
-                self._toast("Success! Save (X) or discard (B)", "success")
-
-        env.step()
+        teleop = teleop_fields(frame, [out.engaged[a] for a in ARMS], [out.tracked[a] for a in ARMS],
+                               self._rtt_ms) if recording else None
+        source = SOURCE_POLICY if driver == "policy" else SOURCE_OPERATOR
+        step, success, _ = control_step(env, before, q_exec, grippers, ee, teleop, source, q_recorded=q_target,
+                                        progress=self._progress)
+        if step is not None and self.recorder.append(now, step, success):
+            self._toast("Success! Save (X) or discard (B)", "success")
         self._task_feedback(now, success)
         self._check_warnings(now)
         self._publish(now, out, success)

@@ -126,7 +126,8 @@ binary pose frames back to headset + JSON status/events to the dashboard (`/ws/d
   the ALOHA/ACT layout `[7 left, left grip, 7 right, right grip]`, grip 0 = closed, 1 = open.
 - **One definition per concept**: contacts = `BimanualEnv.contact_flags` (warnings, recording, audit, eval); arm
   and wrist-camera clearance = `sim.ArmClearance` (generation, retime); a
-  recorded step = `recorder.make_step`, file attrs = `recorder.episode_meta` (live recorder and eval rollouts);
+  recorded step = `recorder.make_step`, one control step (snapshot → apply → record → physics step) =
+  `recorder.control_step` (runtime, eval rollouts, scripted expert, generated takes), file attrs = `recorder.episode_meta` (live recorder and eval rollouts);
   policy obs/action layout = `learn/features.FeatureSpec` (export and `PolicyRunner`; stored in each dataset
   manifest; `joint_vel` adds velocities, `ee_wrench` the hand force/torque to the state; `action_label: executed` labels with the DART-drifted targets actually sent, from `sim/state` via `BimanualEnv.executed_targets`); hand wrench =
   `BimanualEnv.ee_wrench` (recorded as `obs/ee_wrench`); episode selection = `audit.verdict`/`select`/`kept_spans`

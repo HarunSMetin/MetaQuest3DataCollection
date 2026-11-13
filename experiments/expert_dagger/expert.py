@@ -12,7 +12,7 @@ Grasps are re-tried if the brick is not held, the placement uses the brick's tru
 off-centre grasp is compensated), and the tower goal is computed from where the red brick actually lies now.
 
 The arms are driven exactly like the operator's: TCP targets -> BimanualIK (follow the measured joints) ->
-SafetyFilter -> apply. Steps are recorded with recorder.make_step (control/source = operator), so the files are
+SafetyFilter -> apply. Steps are recorded with recorder.control_step (control/source = operator), so the files are
 ordinary episodes for audit / export / check_pipeline.
 """
 
@@ -25,7 +25,7 @@ import numpy as np
 from questcollect.config import Config
 from questcollect.frames import mat_to_quat_wxyz, quat_wxyz_to_mat
 from questcollect.ik import BimanualIK
-from questcollect.recorder import SOURCE_OPERATOR, make_step, teleop_fields
+from questcollect.recorder import control_step, snapshot, teleop_fields
 from questcollect.safety import SafetyFilter
 from questcollect.sim import (ARMS, BRICKS, BUILD_AREA_CENTER, BimanualEnv, _quat_yaw, _rot_z, tower_poses)
 
@@ -364,15 +364,12 @@ def run_episode(cfg: Config, seed: int, max_s: float = 40.0, tail_s: float = 1.5
     steps, clicked_at, changes = [], None, []
     n = round(max_s / env.control_dt)
     for t in range(n):
-        obs, state, flags = env.observe(), env.get_state(), env.contact_flags()
+        before = snapshot(env) if record else None
         q, grippers = ex.act()
         changes.append(ex.last_change)
-        env.apply_action(q, grippers)
-        success, prog = env.success(), env.progress()
+        step, success, prog = control_step(env, before, q, grippers, ex.safety.tcp_poses(), teleop_fields(None))
         if record:
-            steps.append(make_step(env, obs, state, q, grippers, ex.safety.tcp_poses(), success, prog, flags,
-                                   teleop_fields(None), SOURCE_OPERATOR))
-        env.step()
+            steps.append(step)
         if prog >= 1 and clicked_at is None:
             clicked_at = t
         if ex.failed or (ex.arm["r"].done and clicked_at is not None and

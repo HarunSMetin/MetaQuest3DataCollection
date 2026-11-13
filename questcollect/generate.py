@@ -27,7 +27,7 @@ import numpy as np
 
 from questcollect.audit import CONTACT_KINDS
 from questcollect.ik import BimanualIK
-from questcollect.recorder import (AUTO_STOP_TAIL_S, SOURCE_OPERATOR, episode_meta, make_step, read_episode,
+from questcollect.recorder import (AUTO_STOP_TAIL_S, control_step, episode_meta, read_episode, snapshot,
                                    teleop_fields, write_episode)
 from questcollect.sim import (ARM_CLEAR_M, ARMS, BRICKS, CAM_CLEAR_M, SPAWN, SPAWN_JITTER_M, SPAWN_YAW, ArmClearance,
                               BimanualEnv, _quat_yaw, env_from_episode, executed_actions, held_bricks,
@@ -283,8 +283,8 @@ def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray]
     take = Take()
     tail, run = round(AUTO_STOP_TAIL_S * fps), 0
     for t in range(length + round(EXTRA_S * fps)):
-        obs, state, flags = env.observe(), env.get_state(), env.contact_flags()
-        now["obs"] = obs
+        before = snapshot(env)
+        obs = now["obs"] = before.obs
         if not joints:
             now["held"] = held_bricks(env.model, env.data)
         f = {a: frame[a](t) for a in ARMS}
@@ -300,14 +300,12 @@ def replay(env: BimanualEnv, data: dict, fps: int, frames: dict[str, np.ndarray]
             ik.follow(env.data.qpos[env.arm_qadr])
             q_t = ik.solve()
         g = np.array([grips[f["l"], 0], grips[f["r"], 1]])
-        env.apply_action(q_t, g)
-        ok = env.success()
         teleop = teleop_fields(None, [eng[f[a], i] for i, a in enumerate(ARMS)], [True, True], 0.0)
-        take.steps.append(make_step(env, obs, state, q_t, g, ee, ok, env.progress(), flags, teleop, SOURCE_OPERATOR))
-        take.flags.append(flags)
+        step, ok, prog = control_step(env, before, q_t, g, ee, teleop)
+        take.steps.append(step)
+        take.flags.append(before.contacts)
         take.q.append(obs["joint_pos"])
-        take.progress.append(env.progress())
-        env.step()
+        take.progress.append(prog)
         run = run + 1 if ok else 0
         if run >= tail:
             take.end = t + 1

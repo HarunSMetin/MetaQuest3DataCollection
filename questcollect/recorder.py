@@ -54,6 +54,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 
 import h5py
 import numpy as np
@@ -112,6 +113,39 @@ def make_step(env, obs: dict, state: np.ndarray, q_target: np.ndarray, grippers:
         "teleop": teleop,
     }
 
+
+
+class Snapshot(NamedTuple):
+    """What a recorded step keeps from before the action: observation, full sim state, contact flags."""
+    obs: dict
+    state: np.ndarray
+    contacts: np.ndarray
+
+
+def snapshot(env) -> Snapshot:
+    return Snapshot(env.observe(), env.get_state(), env.contact_flags())
+
+
+def control_step(env, before: Snapshot | None, q: np.ndarray, grippers: np.ndarray, ee_targets, teleop: dict,
+                 source: int = SOURCE_OPERATOR, q_recorded: np.ndarray | None = None,
+                 progress: int | None = None) -> tuple[dict | None, bool, int]:
+    """One control step, the same for the live runtime, policy rollouts, the scripted expert and generated takes:
+    apply the joint targets and grippers, read success and progress, make the recorded step, step the physics.
+
+    How the targets were made (IK, policy, safety filter, DART) stays with the caller. before: `snapshot(env)`,
+    taken before the action (its state holds the previous ctrl, which `BimanualEnv.executed_targets` relies on);
+    None records nothing. q_recorded: the action to record if it is not the executed q (the runtime records the
+    operator's target without the DART drift); progress: the value to record instead of env.progress().
+    Returns (recorded step or None, success, progress)."""
+    env.apply_action(q, grippers)
+    success = env.success()
+    progress = env.progress() if progress is None else progress
+    step = None
+    if before is not None:
+        step = make_step(env, before.obs, before.state, q if q_recorded is None else q_recorded, grippers,
+                         ee_targets, success, progress, before.contacts, teleop, source)
+    env.step()
+    return step, success, progress
 
 # -- episode files ---------------------------------------------------------------------------------
 def _flatten(d: dict, prefix: str = "") -> dict[str, object]:

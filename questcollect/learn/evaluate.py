@@ -20,8 +20,8 @@ from questcollect.audit import CONTACT_KINDS, true_runs
 from questcollect.config import Config
 from questcollect.learn.policy import PolicyRunner
 from questcollect.learn.train import run_manifest
-from questcollect.recorder import (AUTO_STOP_TAIL_S, SOURCE_POLICY, episode_meta, make_step, teleop_fields,
-                                   write_episode)
+from questcollect.recorder import (AUTO_STOP_TAIL_S, SOURCE_POLICY, control_step, episode_meta, snapshot,
+                                   teleop_fields, write_episode)
 from questcollect.safety import SafetyFilter
 from questcollect.sim import LEVELS, BimanualEnv
 
@@ -68,16 +68,14 @@ def rollout(env: BimanualEnv, runner: PolicyRunner, safety: SafetyFilter, seed: 
     in_area = False
     success_since = None
     for t in range(max_steps):
-        obs, state, flags = env.observe(), env.get_state(), env.contact_flags()
+        before = snapshot(env)
         q_policy, grippers = runner.act(env)
         q, change = safety.filter(q_policy, env.data.qpos[env.arm_qadr], env.data.qpos[env.finger_qadr])
-        env.apply_action(q, grippers)
-        success, prog = env.success(), env.progress()
+        step, success, prog = control_step(env, before if record else None, q, grippers, safety.tcp_poses(),
+                                           teleop_fields(None), SOURCE_POLICY)
         if record:
-            steps.append(make_step(env, obs, state, q, grippers, safety.tcp_poses(), success, prog, flags,
-                                   teleop_fields(None), SOURCE_POLICY))
-        env.step()
-        contacts.append(flags)
+            steps.append(step)
+        contacts.append(before.contacts)
         changes.append(change)
         progress.append(prog)
         in_area |= env.in_area()

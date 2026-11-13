@@ -58,15 +58,14 @@ about the robot or the bricks is hard-coded in the browser.
 | 3 | `BimanualIK.follow` + `solve` | Targets → 14 joint angles, with the IK held within `ik.max_lead` of the measured joints. When a policy drives instead (see [Control modes](#policy-learning)): `PolicyRunner.act`. |
 | 4 | `SafetyFilter.filter` | Either driver's joint targets, changed as little as possible so the arms keep apart and off the table. These are the recorded action; above `BLOCKED_RAD` of change the operator hears a warning. |
 | 5 | `Recorder.tick` | Advance the countdown; switch to recording when it ends. |
-| 6 | `BimanualEnv.observe` / `get_state` | If recording: snapshot the observation and the full sim state *before* the step. |
-| 7 | `BimanualEnv.apply_action` | Joint targets (plus the DART drift while an operator records, `record.action_noise`) to the arm servos; the gripper target moves at 50 mm/s per finger. |
-| 8 | `Recorder.append` | If recording: store the step built by `recorder.make_step` (obs, action, state, success, progress, clutch, contacts, who drove, raw teleop). |
-| 9 | `BimanualEnv.step` | 10 physics substeps (`physics_dt` = 2 ms), then `_update_clutch` clicks or unclicks bricks. |
-| 10 | `Runtime._task_feedback` | Compare grasp / progress / clutch state with the last tick and emit haptic, sound and toast events. |
-| 11 | `Runtime._check_warnings` | Arm–arm and arm–table contacts (`BimanualEnv.contact_flags`, the one contact definition also used by recording, audit and evaluation), out-of-reach targets. |
-| 12 | `Runtime._publish` | Pack the pose frame; every 5th tick the status dict; every 6th tick camera previews (only while someone is looking). |
+| 6 | `recorder.snapshot` | If recording: the observation, the full sim state and the contact flags *before* the action. |
+| 7 | `recorder.control_step` | `BimanualEnv.apply_action`: joint targets (plus the DART drift while an operator records, `record.action_noise`) to the arm servos, the gripper target moving at 50 mm/s per finger; if recording, the step built by `recorder.make_step` (obs, action without the drift, state, success, progress, clutch, contacts, who drove, raw teleop); then `BimanualEnv.step`: 10 physics substeps (`physics_dt` = 2 ms) and `_update_clutch`, which clicks or unclicks bricks. Rollouts, the scripted expert and generated takes run the same function. |
+| 8 | `Recorder.append` | If recording: store that step. |
+| 9 | `Runtime._task_feedback` | Compare grasp / progress / clutch state with the last tick and emit haptic, sound and toast events. |
+| 10 | `Runtime._check_warnings` | Arm–arm and arm–table contacts (`BimanualEnv.contact_flags`, the one contact definition also used by recording, audit and evaluation), out-of-reach targets. |
+| 11 | `Runtime._publish` | Pack the pose frame; every 5th tick the status dict; every 6th tick camera previews (only while someone is looking). |
 
-During a replay (`replay` command or `qc replay`), steps 2–11 are skipped: the tick just loads the next recorded
+During a replay (`replay` command or `qc replay`), steps 2–10 are skipped: the tick just loads the next recorded
 state with `BimanualEnv.set_state`. The dashboard's replay can start paused at any step (`replay {path, i, paused}`),
 `replay_pause` / `replay_seek {i}` control it, `replay_options {speed, loop}` sets the speed (recorded steps per
 tick, `REPLAY_SPEED_RANGE`) and looping for this and later replays; without loop it holds the last frame until
@@ -205,8 +204,9 @@ than 3 cm away from what the IK can reach, the arm is flagged *out of reach*.
   `status.review` judges the take with the curation rules (`audit.audit_arrays`, `verdict`, `kept_spans`: the same
   code as `qc audit`), shown on the headset HUD.
 - **File format.** One HDF5 file per episode; the full field list is the module docstring of `recorder.py`.
-  Every step is built by `recorder.make_step` and every file's attributes by `recorder.episode_meta`, whoever
-  drove (the live recorder, `qc eval` rollouts), so all episodes look the same. Images are never recorded.
+  Every step is built by `recorder.make_step` inside `recorder.control_step` (snapshot before the action → apply
+  → record → physics step) and every file's attributes by `recorder.episode_meta`, whoever drove (the live
+  recorder, `qc eval` rollouts, the scripted expert, generated takes), so all episodes look the same. Images are never recorded.
 - **Exact replay.** `sim/state` is MuJoCo's full integration state *plus* the six clutch welds' relative poses.
   The welds live in `model.eq_data`, which `mj_getState` doesn't cover, so always use
   `BimanualEnv.get_state` / `set_state`, never raw `mj_getState`.
@@ -300,7 +300,7 @@ and leave nothing to correct, and a raw OU path made the arms visibly tremble (0
 | sounds | `CUES` in `web/src/xr/sounds.ts` | names must match the server's `sound` events |
 | controller buttons | `CONTROLLER_COMMANDS` in `teleop.py` **and** `HINTS` in `web/src/xr/visuals.ts` | |
 | the wire format | `protocol.py` **and** `web/src/protocol.ts` | keep `test_protocol_roundtrip` passing |
-| recorded fields | `recorder.make_step`, the `recorder.py` docstring, bump `SCHEMA_VERSION` | `audit.py` must still read older files |
+| recorded fields | `recorder.make_step` (called by `recorder.control_step`), the `recorder.py` docstring, bump `SCHEMA_VERSION` | `audit.py` must still read older files |
 | what counts as a contact | `BimanualEnv.contact_flags` in `sim.py` | bump `AUDIT_VERSION` in `audit.py` so cached audits are redone |
 | which episodes / steps are trained on | `curate` in `config.yaml`; the rules in `audit.verdict` / `select` | |
 | policy inputs / outputs | `learn` in `config.yaml`; layout code in `learn/features.py` | affects new datasets only; old ones keep theirs |
