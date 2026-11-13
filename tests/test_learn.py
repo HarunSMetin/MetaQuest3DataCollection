@@ -101,7 +101,8 @@ def test_ema_averages_weights_and_swaps_them_in():
         ema.update(model)
     avg = ema.shadow["0.weight"]
     assert torch.all(avg > start) and torch.all(avg < model[0].weight)  # lags behind the raw weights
+    trained = model[0].weight.detach().clone()  # not `start + 50`: fifty float32 additions of 1 can round differently
     raw = ema.swap(model)
-    assert torch.equal(model[0].weight, avg) and torch.equal(raw["0.weight"], start + 50)
+    assert torch.equal(model[0].weight, avg) and torch.equal(raw["0.weight"], trained)
     model.load_state_dict(raw)
-    assert torch.equal(model[0].weight, start + 50)
+    assert torch.equal(model[0].weight, trained)
