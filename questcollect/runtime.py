@@ -83,6 +83,9 @@ class Runtime:
         self._policy_steps = 0  # control steps the policy drove since the scene was reset
         self.control_mode = "teleop"
         self._driver = "operator"
+        # Shared mode after "Take over here": the policy waits until the operator has taken an arm (Grip) and then
+        # released every arm, so a correction can start calmly and be handed back to the policy.
+        self._policy_waits = False
         self._safety_rad = 0.0
         self._noise = np.random.default_rng()
         self._dart = np.zeros(14)  # current DART offset on the executed joint targets (rad)
@@ -287,8 +290,15 @@ class Runtime:
         self._driver = "operator"  # a policy starts a fresh chunk on its first tick
         self._policy_steps = 0
         self._branch = None
+        self._policy_waits = False
         self._grip_latch = [None] * len(ARMS)
         self._dart[:], self._dart_ou[:] = 0.0, 0.0
+
+    def _after_take(self, branch: bool) -> None:
+        """A new scene after a take. After a take-over the operator is working through replays (the headset loads
+        the next one), so a shared-mode policy doesn't start driving the new layout on its own."""
+        self._reset_scene()
+        self._policy_waits = branch and self.control_mode == "shared" and self.policy is not None
 
     def _sync_to_scene(self) -> None:
         """The scene was set from outside (a replayed frame): IK, safety filter and the held operator targets follow
@@ -358,11 +368,12 @@ class Runtime:
                 self._emit({"type": "saved", "path": path})
                 self._toast(f"Saved {path.rsplit('/', 1)[-1]}", "success")
                 self._haptic_both(0.8, 80)
-                self._reset_scene()
+                self._after_take(extra is not None)
         elif name == "discard":
+            branch = self._branch is not None
             if rec.discard():
                 self._toast("Take discarded", "warn")
-                self._reset_scene()
+                self._after_take(branch)
         elif name == "reset":
             rec.discard()
             self._replay = None
@@ -392,6 +403,7 @@ class Runtime:
                 meta, data = read_episode(kw["path"], keys=["sim/state"])
                 states = data["sim/state"]
                 self._branch = None
+                self._policy_waits = False
                 self._replay = {"path": kw["path"], "states": states, "paused": bool(kw.get("paused", False)),
                                 "meta": meta,
                                 "i": int(np.clip(kw.get("i", 0), 0, len(states) - 1)), "acc": 0.0}
@@ -427,6 +439,7 @@ class Runtime:
                 self._toast("No policy loaded: start with qc serve --policy outputs/<run>", "warn")
             elif mode in CONTROL_MODES and mode != self.control_mode:
                 self.control_mode = mode
+                self._policy_waits = False
                 self.teleop.release_all()
                 self._toast({"teleop": "You drive", "policy": "Policy drives",
                              "shared": "Policy drives: take over any time with Grip"}[mode], "info")
@@ -448,9 +461,14 @@ class Runtime:
         self._sync_to_scene()
         # Each gripper keeps its command at that frame (a held brick stays held) until its Trigger matches it.
         self._grip_latch = [float(g) for g in self.env.data.ctrl[self.env.grip_act] / GRIPPER_CTRL_MAX]
+        # Not a policy -> operator handover: that would replace these latches by the last command of a policy that
+        # drove the live scene before the replay (open grippers: the held brick drops).
+        self._driver = "operator"
         self._branch = {"of": r["path"], "step": int(r["i"]), "state": state, "frozen": True}
+        self._policy_waits = self.control_mode == "shared" and self.policy is not None
         rec.start(now)
-        self._toast(f"Taking over at {r['i'] / self.cfg.sim.control_hz:.1f} s: get ready…")
+        self._toast(f"Taking over at {r['i'] / self.cfg.sim.control_hz:.1f} s: get ready…"
+                    + (" Release every arm to hand back to the policy." if self._policy_waits else ""))
 
     def _hold_branch(self, now: float) -> bool:
         """Countdown of a take-over: hold the scene at the branch state (True = this tick is done)."""
@@ -471,6 +489,7 @@ class Runtime:
         b["frozen"] = False
         if self.recorder.state == RecState.IDLE:  # countdown cancelled: a live scene at that state, no take
             self._branch = None
+            self._policy_waits = False
         self.env.set_state(b["state"])
         self._sync_to_scene()
         return False
@@ -560,6 +579,8 @@ class Runtime:
             # Keep the operator side where the arms are, so taking control (Grip) never makes them jump.
             self.ik.reset(q_target)
             self.teleop.sync_hold({a: self._ik_pose(a) for a in ARMS})
+        if driver == "policy" and self._driver == "operator" and recording and self.control_mode == "shared":
+            self._toast("Policy drives: Grip to take over again", "info")
         self._driver = driver
         self._policy_steps += driver == "policy"
         teleop = teleop_fields(frame, [out.engaged[a] for a in ARMS], [out.tracked[a] for a in ARMS],
@@ -577,7 +598,10 @@ class Runtime:
         if self.policy is None or self.control_mode == "teleop":
             return "operator"
         if self.control_mode == "shared" and any(out.engaged.values()):
+            self._policy_waits = False
             return "operator"  # DAgger: the operator took over; the policy resumes when every arm is released
+        if self._policy_waits:
+            return "operator"  # a take-over that hasn't been taken yet: the arms hold still
         return "policy"
 
     def _pattern(self, arm: str | None, pattern: tuple, now: float, sound: str | None = None) -> None:
@@ -735,7 +759,7 @@ class Runtime:
             "loop_hz": round(self._loop_hz, 1),
             "connected": rate > 0,
             "placement": self.placement.column_major(),
-            "control": {"mode": self.control_mode, "driver": self._driver,
+            "control": {"mode": self.control_mode, "driver": self._driver, "waits": self._policy_waits,
                         "policy": None if self.policy is None else self.policy.name,
                         "path": self._policy_path, "loading": self._policy_loading, "error": self._policy_error,
                         "n_action_steps": self._policy_chunk(),
@@ -746,7 +770,8 @@ class Runtime:
                                                           "frozen": self._branch["frozen"]},
             "replay": None if self._replay is None else {
                 "path": self._replay["path"], "i": self._replay["i"], "n": len(self._replay["states"]),
-                "paused": self._replay["paused"], "speed": self._replay_speed, "loop": self._replay_loop},
+                "paused": self._replay["paused"], "speed": self._replay_speed, "loop": self._replay_loop,
+                "fps": self.cfg.sim.control_hz},
         }
         with self._out_lock:
             self._status = status

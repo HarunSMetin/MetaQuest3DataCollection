@@ -5,7 +5,7 @@ import "./xr.css";
 import { Link } from "../net";
 import { levelStates } from "../goal";
 import {
-  B_SECONDARY, B_STICK_X, B_STICK_Y, B_TRIGGER, fetchTask, InputPacker, type ServerEvent, SRC_CONTROLLER, SRC_HAND, SRC_NONE,
+  B_SECONDARY, B_STICK_PRESS, B_STICK_X, B_STICK_Y, B_TRIGGER, fetchTask, InputPacker, type ServerEvent, SRC_CONTROLLER, SRC_HAND, SRC_NONE,
   type Status, type TaskSpec,
 } from "../protocol";
 import { ARM_COLORS, MujocoScene } from "../MujocoScene";
@@ -328,6 +328,37 @@ function interact(dt: number) {
   }
 }
 
+// Replay scrubbing (no take running, right arm released): the right stick moves through the replay, faster the
+// further it is pushed (squared, so a light touch steps single frames), and its click plays / pauses.
+const SCRUB_FPS = 150; // recorded frames per second at full deflection (3x real time at 50 Hz)
+const SCRUB_DEAD = 0.2;
+let scrubI: number | null = null, scrubAcc = 0, scrubSentMs = 0, prevStickPress = 0;
+
+function scrubReplay(dt: number, now: number) {
+  const r = status?.replay, h = sampler.hands.right;
+  if (!r || status!.rec_state !== "idle" || h.source !== SRC_CONTROLLER || mj.engaged.r) {
+    scrubI = null; scrubAcc = 0; prevStickPress = 0;
+    return;
+  }
+  const press = h.buttons[B_STICK_PRESS];
+  if (press > 0.5 && prevStickPress <= 0.5) link.command("replay_pause");
+  prevStickPress = press;
+  const x = h.buttons[B_STICK_X];
+  if (Math.abs(x) < SCRUB_DEAD) { scrubI = null; scrubAcc = 0; return; }
+  if (scrubI === null) {
+    scrubI = r.i;
+    if (!r.paused) link.command("replay_pause", { paused: true });
+  }
+  scrubAcc += Math.sign(x) * ((Math.abs(x) - SCRUB_DEAD) / (1 - SCRUB_DEAD)) ** 2 * SCRUB_FPS * dt;
+  const step = Math.trunc(scrubAcc);
+  if (step && now - scrubSentMs > 40) {
+    scrubAcc -= step;
+    scrubI = Math.min(r.n - 1, Math.max(0, scrubI + step));
+    link.command("replay_seek", { i: scrubI });
+    scrubSentMs = now;
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Render loop
 
@@ -337,7 +368,9 @@ renderer.setAnimationLoop((_t, frame?: XRFrame) => {
     const ref = renderer.xr.getReferenceSpace()!;
     sampler.sample(frame, ref);
     placeMenu();
-    interact(Math.min((now - (lastFrameMs || now)) / 1000, 0.1));
+    const dt = Math.min((now - (lastFrameMs || now)) / 1000, 0.1);
+    interact(dt);
+    scrubReplay(dt, now);
     lastFrameMs = now;
     link.sendBinary(packer.pack(sampler.head, sampler.hands.left, sampler.hands.right, lastServerT));
     tmpQ.fromArray(sampler.head, 3);

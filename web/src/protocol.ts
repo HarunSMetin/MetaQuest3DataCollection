@@ -134,7 +134,7 @@ export interface Status {
   loop_hz: number;
   connected: boolean;
   placement: number[]; // column-major 4x4, world -> xr
-  replay: { path: string; i: number; n: number; paused: boolean; speed: number; loop: boolean } | null;
+  replay: { path: string; i: number; n: number; paused: boolean; speed: number; loop: boolean; fps: number } | null;
   /** This take continues a replayed episode from that step ("Take over here"); frozen = still in the countdown. */
   branch?: { of: string; step: number; frozen: boolean } | null;
   /** The take under review, judged by the curation rules (`qc audit`): null outside review. */
@@ -151,6 +151,7 @@ export interface Status {
   control: {
     mode: "teleop" | "policy" | "shared";
     driver: "operator" | "policy";
+    waits?: boolean;            // shared take-over: the policy waits for Grip, then for every arm to be released
     policy: string | null;      // run name of the loaded policy
     path?: string | null;       // what was loaded: a run folder or a checkpoint's pretrained_model folder
     loading?: string | null;    // a load in progress (background thread)

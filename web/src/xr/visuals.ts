@@ -50,6 +50,10 @@ const HINTS: Record<Arm, Hint[]> = {
       active: (c) => rec(c) !== "review" && !c.s?.replay,
     },
     { comp: "b-button", key: "B", slot: B_SECONDARY, label: () => "Discard", active: (c) => rec(c) !== "idle" },
+    {
+      comp: "xr-standard-thumbstick", key: "R3", slot: B_STICK_PRESS, label: () => "Scrub ↔ · ▶/❚❚",
+      active: (c) => !!c.s?.replay && rec(c) === "idle",
+    },
     ...COMMON,
   ],
   l: [

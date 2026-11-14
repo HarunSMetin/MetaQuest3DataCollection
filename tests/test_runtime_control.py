@@ -166,7 +166,8 @@ def test_replay_pause_seek_and_hold(rt, tmp_path):
     path = str(next(tmp_path.glob("episode_*.hdf5")))
     rt.command("replay", path=path, paused=True, i=5)
     _ticks(rt, 5)
-    assert rt.status()["replay"] == {"path": path, "i": 5, "n": 30, "paused": True, "speed": 1.0, "loop": False}
+    assert rt.status()["replay"] == {"path": path, "i": 5, "n": 30, "paused": True, "speed": 1.0, "loop": False,
+                                       "fps": 50}
     rt.command("replay_options", speed=0.5)
     rt.command("replay_pause")
     _ticks(rt, 4)
@@ -340,3 +341,62 @@ def test_policy_tab_loads_in_the_background(rt, tmp_path, monkeypatch):
     rows = TestClient(create_app(rt)).get("/api/policies").json()
     assert rows[0]["steps"] == ["010000", "020000"] and rows[0]["last"] == "020000" and rows[0]["type"] == "diffusion"
     assert rows[0]["evals"][0]["checkpoint"] == "020000" and rows[0]["evals"][0]["stage_rates"] == {"level_1": 0.4}
+
+
+def test_shared_take_over_waits_for_the_operator_then_hands_back(rt, tmp_path):
+    """Shared mode + "Take over here": the policy doesn't grab the arms after the countdown; it waits until the
+    operator has taken an arm and released every arm, then drives again (hand back)."""
+    rt.recorder.out_dir = tmp_path
+    rt.cfg.record.countdown_s = 0
+    rt.control_mode = "policy"
+    rt.command("record_toggle")
+    _ticks(rt, 30)
+    rt.command("save", success=False)
+    _ticks(rt, 1)
+    rt.recorder.flush()
+    src = str(next(tmp_path.glob("episode_*.hdf5")))
+
+    rt.control_mode = "shared"
+    rt.command("replay", path=src, paused=True, i=10)
+    _ticks(rt, 2)
+    rt.command("replay_branch")
+    _ticks(rt, 40, _controllers())
+    assert rt.recorder.recording and rt._driver == "operator" and rt.status()["control"]["waits"]
+    _ticks(rt, 3, _controllers(squeeze_left=1.0))  # Grip: the operator takes the left arm
+    _ticks(rt, 10, _controllers())
+    assert rt._driver == "operator" and not rt._policy_waits
+    _ticks(rt, 3, _controllers(squeeze_left=1.0))  # Grip again: every arm released, back to the policy
+    _ticks(rt, 2, _controllers())
+    assert rt._driver == "policy"
+    rt.command("save", success=False)  # the next layout isn't the policy's: the headset loads the next replay
+    _ticks(rt, 10, _controllers())
+    assert rt._driver == "operator" and rt._policy_waits
+
+
+def test_take_over_keeps_the_replayed_grippers(rt, tmp_path):
+    """A take-over keeps each gripper as it was at the replayed frame (a held brick stays held), also when a policy
+    was driving the live scene with open grippers before the replay."""
+    rt.recorder.out_dir = tmp_path
+    rt.cfg.record.countdown_s = 0
+    rt.control_mode = "policy"
+    rt.policy.act = lambda env: (rt.policy.q.copy(), np.zeros(2))  # closes both grippers
+    rt.command("record_toggle")
+    _ticks(rt, 120)
+    rt.command("save", success=False)
+    _ticks(rt, 1)
+    rt.recorder.flush()
+    src = str(next(tmp_path.glob("episode_*.hdf5")))
+
+    rt.control_mode = "shared"
+    rt.policy.act = lambda env: (rt.policy.q.copy(), np.ones(2))  # the live scene: grippers open
+    _ticks(rt, 20, _controllers())
+    assert rt._driver == "policy"
+    rt.command("replay", path=src, paused=True, i=110)
+    _ticks(rt, 2)
+    rt.command("replay_branch")
+    _ticks(rt, 30, _controllers())  # Triggers released (= open), the policy waits
+    assert np.allclose(rt.env.data.ctrl[rt.env.grip_act], 0)
+    _ticks(rt, 3, _controllers(squeeze_left=1.0))  # Grip: take the left arm, Trigger still released
+    _ticks(rt, 30, _controllers())
+    assert rt._driver == "operator"
+    assert np.allclose(rt.env.data.ctrl[rt.env.grip_act], 0)  # still closed

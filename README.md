@@ -351,6 +351,15 @@ to the recording folder and starts at that frame's state (`sim/state[0]` = the s
 its file names the source (`branch_of`, `branch_step`) and the Episodes tab shows "↳ taken over from …". This is
 how to collect recovery data from real mistakes, your own or a policy's (offline DAgger), without staging them.
 It works for episodes recorded in today's scene (`scene_hash`); older ones can be replayed but not continued.
+All of this also works from inside the headset: the wrist menu's **⏯ Replay** page picks a dataset and an
+episode (◀ ▶), plays, pauses and steps it (±5 s, ±1 s, single frames, speed), and has Take over here, Success /
+Failure / Discard and Close replay. During a replay the **right stick** scrubs (a light push steps single frames,
+a full push 3× real time) and its click plays / pauses.
+With a policy loaded in **shared** mode (the Replay page's 🤝 Shared / 🎮 Only me button, or the dashboard), a
+take-over is handed back: after the countdown the policy waits; take an arm with Grip, correct, then release every
+arm and the policy carries on from there (Grip again to take over again). The export keeps only your steps.
+After a take-over the headset goes on with the replays: saved -> the next episode plays, discarded -> the same one
+again, paused at the frame you took over (the new live scene isn't handed to the policy).
 
 ### 5. Train and evaluate a policy
 
